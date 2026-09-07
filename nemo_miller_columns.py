@@ -72,6 +72,10 @@ class ColumnView(Gtk.Box):
         self.on_item_selected = on_item_selected
         self.on_item_activated = on_item_activated
         self.icon_theme = Gtk.IconTheme.get_default()
+        self.active_item_path = None
+        self.marked_paths = set()
+        self.mark_anchor_path = None
+        self._extend_marks_on_next_selection = False
 
         # Set minimum width
         self.set_size_request(self.MIN_WIDTH, -1)
@@ -85,8 +89,10 @@ class ColumnView(Gtk.Box):
         # ListBox for items
         self.listbox = Gtk.ListBox()
         self.listbox.set_selection_mode(Gtk.SelectionMode.SINGLE)
+        self.listbox.set_activate_on_single_click(False)
         self.listbox.connect("row-selected", self._on_row_selected)
         self.listbox.connect("row-activated", self._on_row_activated)
+        self.listbox.connect("button-press-event", self._on_button_press)
         self.listbox.get_style_context().add_class("miller-column")
 
         scroll.add(self.listbox)
@@ -166,7 +172,12 @@ class ColumnView(Gtk.Box):
     def _on_row_selected(self, listbox, row):
         """Handles row selection"""
         if row and hasattr(row, 'item'):
+            self.active_item_path = row.item.path
+            if self._extend_marks_on_next_selection:
+                self._mark_range_to(row.item.path)
             self.on_item_selected(self, row.item)
+        elif row is None:
+            self.active_item_path = None
 
     def _on_row_activated(self, listbox, row):
         """Handles row activation (double-click)"""
@@ -180,6 +191,154 @@ class ColumnView(Gtk.Box):
             if hasattr(row, 'item') and row.item.path == path:
                 self.listbox.select_row(row)
                 return True
+        return False
+
+    def get_active_item(self):
+        """Returns the single row that drives navigation and preview."""
+        row = self.listbox.get_selected_row()
+        if row is not None and hasattr(row, 'item'):
+            return row.item
+        return None
+
+    def grab_navigation_focus(self):
+        """Moves focus to the active row, or the first row if none is active."""
+        row = self.listbox.get_selected_row()
+        if row is None:
+            row = self.listbox.get_row_at_index(0)
+            if row is not None:
+                # Establish only ACTIVE selection. Operation marks are managed
+                # independently and remain unchanged.
+                self.listbox.select_row(row)
+        if row is not None:
+            row.grab_focus()
+        else:
+            self.listbox.grab_focus()
+
+    def _on_button_press(self, listbox, event):
+        """Updates marks for a mouse gesture while GTK controls the active row."""
+        if event.button != 1 or event.type != Gdk.EventType.BUTTON_PRESS:
+            return False
+        if event.state & (
+                Gdk.ModifierType.MOD1_MASK |
+                Gdk.ModifierType.MOD4_MASK |
+                Gdk.ModifierType.SUPER_MASK):
+            return False
+
+        row = self.listbox.get_row_at_y(int(event.y))
+        if row is None or not hasattr(row, 'item'):
+            return False
+
+        path = row.item.path
+        if event.state & Gdk.ModifierType.SHIFT_MASK:
+            if self.mark_anchor_path is None:
+                self.mark_anchor_path = self.active_item_path or path
+            self._mark_range_to(path)
+        elif event.state & Gdk.ModifierType.CONTROL_MASK:
+            self._toggle_mark(path)
+        else:
+            # A directory click is navigation. It becomes an operation mark
+            # only through explicit Space/Ctrl/Shift marking.
+            self.marked_paths = set() if row.item.is_dir else {path}
+            self.mark_anchor_path = path
+            self._refresh_mark_styles()
+
+        # SINGLE mode may natively deselect a Ctrl-clicked active row. Restore
+        # that clicked row after GTK processes the event so it remains active.
+        if event.state & (
+                Gdk.ModifierType.CONTROL_MASK |
+                Gdk.ModifierType.SHIFT_MASK):
+            GLib.idle_add(self._ensure_mouse_active, row)
+        return False
+
+    def _ensure_mouse_active(self, row):
+        """Keeps a modifier-clicked row active without opening it."""
+        if row.get_parent() is self.listbox:
+            self.listbox.select_row(row)
+        return False
+
+    def _ordered_item_paths(self):
+        return [
+            row.item.path for row in self.listbox.get_children()
+            if hasattr(row, 'item')
+        ]
+
+    def _toggle_mark(self, path):
+        if path in self.marked_paths:
+            self.marked_paths.remove(path)
+        else:
+            self.marked_paths.add(path)
+        if self.mark_anchor_path is None:
+            self.mark_anchor_path = path
+        self._refresh_mark_styles()
+
+    def _mark_range_to(self, path):
+        ordered_paths = self._ordered_item_paths()
+        try:
+            anchor_index = ordered_paths.index(self.mark_anchor_path)
+            path_index = ordered_paths.index(path)
+        except ValueError:
+            self.mark_anchor_path = path
+            self.marked_paths = {path}
+        else:
+            start, end = sorted((anchor_index, path_index))
+            self.marked_paths = set(ordered_paths[start:end + 1])
+        self._refresh_mark_styles()
+
+    def _refresh_mark_styles(self):
+        for row in self.listbox.get_children():
+            if not hasattr(row, 'item'):
+                continue
+            style = row.get_style_context()
+            if row.item.path in self.marked_paths:
+                style.add_class("marked-item")
+            else:
+                style.remove_class("marked-item")
+
+    def prepare_keyboard_range_extension(self):
+        """Lets native Shift+Up/Down move active, then marks its range."""
+        if self.mark_anchor_path is None:
+            self.mark_anchor_path = self.active_item_path
+        self._extend_marks_on_next_selection = True
+        GLib.idle_add(self._finish_keyboard_range_extension)
+
+    def _finish_keyboard_range_extension(self):
+        self._extend_marks_on_next_selection = False
+        return False
+
+    def toggle_active_mark(self):
+        """Toggles the active item without changing active selection."""
+        if self.active_item_path is None:
+            return False
+        self._toggle_mark(self.active_item_path)
+        return True
+
+    def mark_all(self):
+        """Marks every selectable item without navigation side effects."""
+        self.marked_paths = set(self._ordered_item_paths())
+        self._refresh_mark_styles()
+
+    def clear_marks(self):
+        """Clears operation marks and anchor without changing active item."""
+        had_marks = bool(self.marked_paths)
+        self.marked_paths.clear()
+        self.mark_anchor_path = None
+        self._extend_marks_on_next_selection = False
+        self._refresh_mark_styles()
+        return had_marks
+
+    def get_marked_items(self):
+        """Returns marked items in visible row order for future operations."""
+        return [
+            row.item for row in self.listbox.get_children()
+            if hasattr(row, 'item') and row.item.path in self.marked_paths
+        ]
+
+    def contains_focus(self, focused_widget):
+        """Returns whether GTK focus is within this column's listbox."""
+        while focused_widget is not None:
+            if focused_widget is self.listbox:
+                return True
+            focused_widget = focused_widget.get_parent()
         return False
 
 
@@ -858,6 +1017,13 @@ class MillerColumnsWindow(Gtk.ApplicationWindow):
         self._navigate_to(self.current_path)
 
         self.connect("key-press-event", self._on_key_press)
+        self.miller_key_controller = Gtk.EventControllerKey.new(self)
+        self.miller_key_controller.set_propagation_phase(
+            Gtk.PropagationPhase.CAPTURE
+        )
+        self.miller_key_controller.connect(
+            "key-pressed", self._on_miller_navigation_key_pressed
+        )
         self.show_all()
 
     def _setup_css(self):
@@ -876,8 +1042,20 @@ class MillerColumnsWindow(Gtk.ApplicationWindow):
         }
 
         .miller-column row:selected {
+            background-color: alpha(@theme_selected_bg_color, 0.20);
+            color: @theme_fg_color;
+            box-shadow: inset 0 0 0 1px @theme_selected_bg_color;
+        }
+
+        .miller-column row.marked-item {
             background-color: @theme_selected_bg_color;
             color: @theme_selected_fg_color;
+        }
+
+        .miller-column row.marked-item:selected {
+            background-color: @theme_selected_bg_color;
+            color: @theme_selected_fg_color;
+            box-shadow: inset 0 0 0 2px @theme_selected_fg_color;
         }
 
         .preview-frame {
@@ -1041,19 +1219,24 @@ class MillerColumnsWindow(Gtk.ApplicationWindow):
 
     def _on_item_activated(self, item):
         """Handles item activation (double-click)"""
-        if not item.is_dir:
-            try:
-                subprocess.Popen(['xdg-open', str(item.path)])
-            except Exception as e:
-                dialog = Gtk.MessageDialog(
-                    transient_for=self,
-                    flags=0,
-                    message_type=Gtk.MessageType.ERROR,
-                    buttons=Gtk.ButtonsType.OK,
-                    text=f"Cannot open file: {e}"
-                )
-                dialog.run()
-                dialog.destroy()
+        if item.is_dir:
+            focused_column = self._get_focused_column()
+            if focused_column is not None:
+                self._enter_active_item(focused_column)
+            return
+
+        try:
+            subprocess.Popen(['xdg-open', str(item.path)])
+        except Exception as e:
+            dialog = Gtk.MessageDialog(
+                transient_for=self,
+                flags=0,
+                message_type=Gtk.MessageType.ERROR,
+                buttons=Gtk.ButtonsType.OK,
+                text=f"Cannot open file: {e}"
+            )
+            dialog.run()
+            dialog.destroy()
 
     def _on_go_back(self, button):
         """Goes to parent directory"""
@@ -1177,16 +1360,56 @@ class MillerColumnsWindow(Gtk.ApplicationWindow):
 
     def _on_key_press(self, widget, event):
         """Handles keyboard shortcuts"""
-        # Ctrl+F: Focus search entry
+        focused_column = self._get_focused_column()
+
+        # Ctrl+A: mark all items in the focused Miller column.
         if event.state & Gdk.ModifierType.CONTROL_MASK:
+            if (event.keyval == Gdk.KEY_a and
+                    not event.state & (
+                        Gdk.ModifierType.SHIFT_MASK |
+                        Gdk.ModifierType.MOD1_MASK |
+                        Gdk.ModifierType.MOD4_MASK |
+                        Gdk.ModifierType.SUPER_MASK
+                    ) and focused_column is not None):
+                focused_column.mark_all()
+                return True
+
+            # Ctrl+F: Focus search entry
             if event.keyval == Gdk.KEY_f:
                 self.search_entry.grab_focus()
                 return True
+
+        # Space toggles only the active item's operation mark.
+        if (event.keyval == Gdk.KEY_space and
+                not event.state & (
+                    Gdk.ModifierType.SHIFT_MASK |
+                    Gdk.ModifierType.CONTROL_MASK |
+                    Gdk.ModifierType.MOD1_MASK |
+                    Gdk.ModifierType.MOD4_MASK |
+                    Gdk.ModifierType.SUPER_MASK
+                ) and focused_column is not None):
+            focused_column.toggle_active_mark()
+            return True
+
+        # Native Gtk.ListBox still moves the active row. This flag only makes
+        # Shift+Up/Down extend operation marks when that selection callback runs.
+        if (event.state & Gdk.ModifierType.SHIFT_MASK and
+                not event.state & (
+                    Gdk.ModifierType.CONTROL_MASK |
+                    Gdk.ModifierType.MOD1_MASK |
+                    Gdk.ModifierType.MOD4_MASK |
+                    Gdk.ModifierType.SUPER_MASK
+                ) and event.keyval in (Gdk.KEY_Up, Gdk.KEY_Down) and
+                focused_column is not None):
+            focused_column.prepare_keyboard_range_extension()
+            return False
 
         # Escape: Exit search mode or close window
         if event.keyval == Gdk.KEY_Escape:
             if self.search_mode:
                 self._exit_search_mode()
+                return True
+            elif self._clear_all_marks():
                 return True
             else:
                 self.close()
@@ -1200,6 +1423,80 @@ class MillerColumnsWindow(Gtk.ApplicationWindow):
                 return True
 
         return False
+
+    def _get_focused_column(self):
+        """Returns the Miller column containing the current GTK focus."""
+        focused_widget = self.get_focus()
+        if isinstance(focused_widget, Gtk.Editable):
+            return None
+        for column in self.columns_container.columns:
+            if column.contains_focus(focused_widget):
+                return column
+        return None
+
+    def _on_miller_navigation_key_pressed(self, controller, keyval,
+                                          keycode, state):
+        """Captures Miller keys before GTK moves focus out of a column."""
+        column = self._get_focused_column()
+        if state & (
+                Gdk.ModifierType.SHIFT_MASK |
+                Gdk.ModifierType.CONTROL_MASK |
+                Gdk.ModifierType.MOD1_MASK |
+                Gdk.ModifierType.MOD4_MASK |
+                Gdk.ModifierType.SUPER_MASK):
+            return False
+
+        if column is None:
+            return False
+        if keyval == Gdk.KEY_Left:
+            self._focus_previous_column(column)
+            return True
+        if keyval in (Gdk.KEY_Right, Gdk.KEY_Return, Gdk.KEY_KP_Enter):
+            self._enter_active_item(column)
+            return True
+        return False
+
+    def _clear_all_marks(self):
+        """Clears marks in every live column without changing navigation."""
+        had_marks = False
+        for column in self.columns_container.columns:
+            had_marks = column.clear_marks() or had_marks
+        return had_marks
+
+    def _focus_previous_column(self, column):
+        """Moves focus left without changing selections or navigation state."""
+        try:
+            index = self.columns_container.columns.index(column)
+        except ValueError:
+            return
+        if index > 0:
+            target = self.columns_container.columns[index - 1]
+            GLib.idle_add(self._apply_column_focus, target)
+
+    def _apply_column_focus(self, column):
+        """Applies focus after the current GTK key event has completed."""
+        column.grab_navigation_focus()
+        return False
+
+    def _enter_active_item(self, column):
+        """Focuses a directory child or opens a file through existing behavior."""
+        item = column.get_active_item()
+        if item is None:
+            return
+        if not item.is_dir:
+            self._on_item_activated(item)
+            return
+
+        try:
+            index = self.columns_container.columns.index(column)
+        except ValueError:
+            return
+        child_index = index + 1
+        if child_index < len(self.columns_container.columns):
+            child = self.columns_container.columns[child_index]
+            if child.path == item.path:
+                GLib.idle_add(self._apply_column_focus, child)
+                return
 
 
 class MillerColumnsApp(Gtk.Application):
