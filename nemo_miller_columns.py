@@ -15,6 +15,8 @@ from pathlib import Path
 from dataclasses import dataclass
 from typing import Generator, Optional
 
+from navigation_state import NavigationError, NavigationState, SelectionEventGate
+
 gi.require_version('Gtk', '3.0')
 gi.require_version('GdkPixbuf', '2.0')
 gi.require_version('Pango', '1.0')
@@ -72,6 +74,7 @@ class ColumnView(Gtk.Box):
         self.on_item_selected = on_item_selected
         self.on_item_activated = on_item_activated
         self.icon_theme = Gtk.IconTheme.get_default()
+        self.selection_event_gate = SelectionEventGate()
 
         # Set minimum width
         self.set_size_request(self.MIN_WIDTH, -1)
@@ -164,8 +167,12 @@ class ColumnView(Gtk.Box):
         return row
 
     def _on_row_selected(self, listbox, row):
-        """Handles row selection"""
-        if row and hasattr(row, 'item'):
+        """Forwards user selection or deselection to navigation state."""
+        if not self.selection_event_gate.user_notifications_enabled:
+            return
+        if row is None:
+            self.on_item_selected(self, None)
+        elif hasattr(row, 'item'):
             self.on_item_selected(self, row.item)
 
     def _on_row_activated(self, listbox, row):
@@ -173,14 +180,31 @@ class ColumnView(Gtk.Box):
         if row and hasattr(row, 'item'):
             self.on_item_activated(row.item)
 
-    def select_path(self, path):
-        """Selects an item by its path"""
-        path = Path(path)
+    def find_item(self, path):
+        """Returns the currently rendered item for a path, if present."""
+        if path is None:
+            return None
+        target = Path(path)
         for row in self.listbox.get_children():
-            if hasattr(row, 'item') and row.item.path == path:
-                self.listbox.select_row(row)
-                return True
-        return False
+            if hasattr(row, 'item') and row.item.path == target:
+                return row.item
+        return None
+
+    def restore_cursor(self, path):
+        """Restore visual selection without emitting a user navigation event."""
+        target = Path(path) if path is not None else None
+        selected_row = None
+        for row in self.listbox.get_children():
+            if hasattr(row, 'item') and row.item.path == target:
+                selected_row = row
+                break
+
+        # Gtk.ListBox.select_row() emits row-selected synchronously. Restrict
+        # suppression to this one view-level reconciliation operation.
+        with self.selection_event_gate.programmatic_change():
+            self.listbox.select_row(selected_row)
+
+        return target is None or selected_row is not None
 
 
 class ResizeHandle(Gtk.EventBox):
@@ -662,8 +686,8 @@ class MillerColumnsContainer(Gtk.Box):
 
         self.get_style_context().add_class("miller-columns-container")
 
-    def add_column(self, path):
-        """Adds a new column"""
+    def _add_column(self, path):
+        """Adds one low-level view column during state reconciliation."""
         column = ColumnView(path, self._on_item_selected, self.on_item_activated_callback)
 
         # If there are existing columns, add a resize handle
@@ -685,15 +709,9 @@ class MillerColumnsContainer(Gtk.Box):
 
         return column
 
-    def remove_columns_after(self, column):
-        """Removes all columns after the specified one"""
-        if column not in self.columns:
-            return
-
-        idx = self.columns.index(column)
-
-        # Remove columns and handles
-        while len(self.columns) > idx + 1:
+    def _truncate_columns(self, count):
+        """Removes view columns from the right until ``count`` remain."""
+        while len(self.columns) > count:
             col = self.columns.pop()
             self.remove(col)
             col.destroy()
@@ -704,20 +722,46 @@ class MillerColumnsContainer(Gtk.Box):
                 self.remove(handle)
                 handle.destroy()
 
-        # Recalculate widths
+    def reconcile(self, navigation_state):
+        """Render columns and cursors from canonical NavigationState."""
+        target_paths = navigation_state.visible_directories
+        common_count = 0
+        for column, path in zip(self.columns, target_paths):
+            if column.path != path:
+                break
+            common_count += 1
+
+        self._truncate_columns(common_count)
+        for path in target_paths[common_count:]:
+            self._add_column(path)
+
+        for column, cursor in zip(self.columns, navigation_state.cursor_paths):
+            column.restore_cursor(cursor)
+
+        self._assert_structure()
         GLib.idle_add(self._distribute_widths)
+
+    def get_current_item(self, navigation_state):
+        """Resolve the canonical current cursor back to its rendered FileItem."""
+        path = navigation_state.current_item
+        if path is None:
+            return None
+        index = navigation_state.active_column_index
+        if not 0 <= index < len(self.columns):
+            return None
+        return self.columns[index].find_item(path)
 
     def clear(self):
         """Removes all columns"""
-        for col in self.columns:
-            self.remove(col)
-            col.destroy()
-        for handle in self.handles:
-            self.remove(handle)
-            handle.destroy()
-        self.columns.clear()
-        self.handles.clear()
-        self.column_widths.clear()
+        self._truncate_columns(0)
+        self._assert_structure()
+
+    def _assert_structure(self):
+        """Checks the parallel widget/width/handle representation."""
+        assert len(self.column_widths) == len(self.columns)
+        assert len(self.handles) == max(0, len(self.columns) - 1)
+        for index, handle in enumerate(self.handles):
+            assert handle.column_index == index
 
     def _on_item_selected(self, column, item):
         """Handles selection and recalculates widths"""
@@ -802,7 +846,12 @@ class MillerColumnsWindow(Gtk.ApplicationWindow):
         super().__init__(application=app, title="Nemo Miller Columns")
 
         self.set_default_size(1200, 700)
-        self.current_path = Path(start_path or Path.home())
+        requested_path = Path(start_path or Path.home())
+        try:
+            self.navigation_state = NavigationState(requested_path)
+        except NavigationError as error:
+            print(f"Cannot navigate to {requested_path}: {error}")
+            self.navigation_state = NavigationState(Path.home())
 
         # Search state
         self.search_mode = False
@@ -854,11 +903,16 @@ class MillerColumnsWindow(Gtk.ApplicationWindow):
 
         self.main_paned.set_position(900)
 
-        # Navigate to initial path
-        self._navigate_to(self.current_path)
+        # Render the validated initial navigation state.
+        self._reconcile_navigation()
 
         self.connect("key-press-event", self._on_key_press)
         self.show_all()
+
+    @property
+    def current_path(self):
+        """Compatibility view of the canonical current directory."""
+        return self.navigation_state.current_directory
 
     def _setup_css(self):
         """Sets up custom CSS styles"""
@@ -1003,41 +1057,42 @@ class MillerColumnsWindow(Gtk.ApplicationWindow):
 
     def _navigate_to(self, path):
         """Navigates to a specific path"""
-        path = Path(path).resolve()
+        if not self.navigation_state.navigate_to(path):
+            print(self.navigation_state.last_error)
+            return False
 
-        if not path.exists():
-            return
+        self._reconcile_navigation()
+        return True
 
-        self.columns_container.clear()
-
-        parts = path.parts
-        current = Path(parts[0])
-
-        self.columns_container.add_column(current)
-
-        for part in parts[1:]:
-            next_path = current / part
-            if next_path.is_dir():
-                if self.columns_container.columns:
-                    self.columns_container.columns[-1].select_path(next_path)
-                self.columns_container.add_column(next_path)
-                current = next_path
-
-        self.current_path = path
+    def _reconcile_navigation(self):
+        """Render navigation widgets and preview from canonical state."""
+        self.columns_container.reconcile(self.navigation_state)
         self._update_path_bar()
+        self.preview_panel.update(
+            self.columns_container.get_current_item(self.navigation_state)
+        )
 
     def _on_item_selected(self, column, item):
-        """Handles item selection"""
-        self.columns_container.remove_columns_after(column)
+        """Handles user item selection or explicit deselection."""
+        try:
+            column_index = self.columns_container.columns.index(column)
+        except ValueError:
+            return
 
-        if item.is_dir:
-            self.columns_container.add_column(item.path)
-            self.current_path = item.path
+        if item is None:
+            transition_succeeded = self.navigation_state.clear_cursor(column_index)
         else:
-            self.current_path = item.path.parent
+            transition_succeeded = self.navigation_state.select_item(
+                column_index, item.path, item.is_dir
+            )
 
-        self._update_path_bar()
-        self.preview_panel.update(item)
+        if not transition_succeeded:
+            print(self.navigation_state.last_error)
+
+        # On failure this restores widget selection from unchanged state; on
+        # success it renders the new path chain. Restoration is notification-
+        # suppressed by each ColumnView and cannot recurse into this method.
+        self._reconcile_navigation()
 
     def _on_item_activated(self, item):
         """Handles item activation (double-click)"""
