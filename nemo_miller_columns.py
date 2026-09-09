@@ -26,6 +26,11 @@ from gi.repository import Gtk, Gdk, GdkPixbuf, Gio, GLib, Pango
 CLIPBOARD_COPY = "copy"
 CLIPBOARD_CUT = "cut"
 RESIZE_HANDLE_WIDTH = 6
+MAX_PREVIEW_BYTES = 256 * 1024
+MAX_PREVIEW_LINES = 200
+UNSUPPORTED_PREVIEW_IMAGE = (
+    Path(__file__).resolve().parent / "assets" / "unsupported-preview.jpeg"
+)
 
 
 class FileOperationError(Exception):
@@ -199,6 +204,60 @@ def trash_path(path):
         raise FileOperationError(str(error)) from error
     if not trashed:
         raise FileOperationError(f"Trash operation was not supported for: {path}")
+
+
+@dataclass(frozen=True)
+class FilePreviewData:
+    kind: str
+    text: str = ""
+    truncated: bool = False
+    message: str = ""
+
+
+def load_file_preview(path):
+    """Load bounded plain text metadata or classify an image/unsupported file."""
+    path = Path(path)
+    mime_type, _encoding = mimetypes.guess_type(str(path))
+    if mime_type and mime_type.startswith("image/"):
+        return FilePreviewData(kind="image")
+
+    text_mime = (
+        mime_type is None or
+        mime_type.startswith("text/") or
+        mime_type in {
+            "application/json",
+            "application/xml",
+            "application/javascript",
+            "application/x-python",
+            "application/x-sh",
+            "application/x-perl",
+        }
+    )
+    if not text_mime:
+        return FilePreviewData(
+            kind="unsupported", message=mime_type or "Unsupported file"
+        )
+
+    try:
+        with open(path, "rb") as file_handle:
+            content = file_handle.read(MAX_PREVIEW_BYTES + 1)
+    except OSError as error:
+        return FilePreviewData(kind="unsupported", message=str(error))
+
+    if b"\x00" in content:
+        return FilePreviewData(kind="unsupported", message="Binary file")
+
+    byte_truncated = len(content) > MAX_PREVIEW_BYTES
+    content = content[:MAX_PREVIEW_BYTES]
+    text = content.decode("utf-8", errors="replace")
+    lines = text.splitlines()
+    line_truncated = len(lines) > MAX_PREVIEW_LINES
+    visible_text = "\n".join(lines[:MAX_PREVIEW_LINES])
+    return FilePreviewData(
+        kind="text",
+        text=visible_text,
+        truncated=byte_truncated or line_truncated,
+    )
 
 
 class FileItem:
@@ -575,6 +634,149 @@ class ColumnView(Gtk.Box):
         return False
 
 
+class FilePreviewColumn(Gtk.Box):
+    """Non-interactive text/image preview occupying the reserved child slot."""
+
+    def __init__(self, path):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        self.path = Path(path)
+        self._destroyed = False
+        self._pixbuf = None
+        self.preview_kind = "loading"
+        self.set_hexpand(False)
+        self.set_size_request(1, -1)
+        self.get_style_context().add_class("file-preview-column")
+        self.connect("destroy", self._on_destroy)
+
+        title = Gtk.Label(label=self.path.name)
+        title.set_xalign(0)
+        title.set_ellipsize(Pango.EllipsizeMode.MIDDLE)
+        title.set_margin_start(8)
+        title.set_margin_end(8)
+        title.set_margin_top(6)
+        self.pack_start(title, False, False, 0)
+
+        self.content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        loading = Gtk.Label(label="Loading preview…")
+        loading.get_style_context().add_class("dim-label")
+        self.content.pack_start(loading, True, True, 12)
+        self.pack_start(self.content, True, True, 0)
+        self.show_all()
+
+        threading.Thread(
+            target=self._load_preview,
+            daemon=True,
+        ).start()
+
+    def _on_destroy(self, widget):
+        self._destroyed = True
+
+    def _load_preview(self):
+        data = load_file_preview(self.path)
+        pixbuf = None
+        if data.kind == "image":
+            try:
+                pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_scale(
+                    str(self.path), 1024, 1024, True
+                )
+            except Exception as error:
+                data = FilePreviewData(
+                    kind="unsupported", message=f"Image error: {error}"
+                )
+
+        if data.kind == "unsupported" and UNSUPPORTED_PREVIEW_IMAGE.exists():
+            try:
+                pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_scale(
+                    str(UNSUPPORTED_PREVIEW_IMAGE), 512, 512, True
+                )
+            except Exception:
+                pixbuf = None
+
+        GLib.idle_add(self._apply_preview, data, pixbuf)
+
+    def _apply_preview(self, data, pixbuf):
+        if self._destroyed:
+            return False
+        self.preview_kind = data.kind
+        for child in self.content.get_children():
+            self.content.remove(child)
+
+        if data.kind == "text":
+            self._show_text(data)
+        else:
+            self._show_image_or_fallback(data, pixbuf)
+        self.content.show_all()
+        return False
+
+    def _show_text(self, data):
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        scroll.set_vexpand(True)
+
+        text_view = Gtk.TextView()
+        text_view.set_editable(False)
+        text_view.set_cursor_visible(False)
+        text_view.set_monospace(True)
+        text_view.set_wrap_mode(Gtk.WrapMode.NONE)
+        text_view.set_left_margin(8)
+        text_view.set_right_margin(8)
+        text_view.set_top_margin(8)
+        text_view.set_bottom_margin(8)
+        text_view.get_buffer().set_text(data.text)
+        scroll.add(text_view)
+        self.content.pack_start(scroll, True, True, 0)
+
+        if data.truncated:
+            status = Gtk.Label(label="Preview truncated")
+            status.get_style_context().add_class("dim-label")
+            self.content.pack_start(status, False, False, 6)
+
+    def _show_image_or_fallback(self, data, pixbuf):
+        self._pixbuf = pixbuf
+        if pixbuf is not None:
+            drawing = Gtk.DrawingArea()
+            drawing.set_size_request(1, 1)
+            drawing.set_vexpand(True)
+            drawing.connect("draw", self._draw_pixbuf)
+            self.content.pack_start(drawing, True, True, 0)
+        else:
+            icon = Gtk.Image.new_from_icon_name(
+                "dialog-question-symbolic", Gtk.IconSize.DIALOG
+            )
+            self.content.pack_start(icon, True, True, 12)
+
+        if data.kind == "unsupported":
+            message = Gtk.Label(label=data.message or "Preview unavailable")
+            message.set_ellipsize(Pango.EllipsizeMode.END)
+            message.set_max_width_chars(1)
+            message.set_tooltip_text(data.message or "Preview unavailable")
+            message.set_margin_start(8)
+            message.set_margin_end(8)
+            message.set_margin_bottom(8)
+            message.get_style_context().add_class("dim-label")
+            self.content.pack_start(message, False, False, 0)
+
+    def _draw_pixbuf(self, widget, context):
+        if self._pixbuf is None:
+            return False
+        allocation = widget.get_allocation()
+        pixbuf_width = self._pixbuf.get_width()
+        pixbuf_height = self._pixbuf.get_height()
+        scale = min(
+            allocation.width / pixbuf_width,
+            allocation.height / pixbuf_height,
+        )
+        x = (allocation.width - pixbuf_width * scale) / 2
+        y = (allocation.height - pixbuf_height * scale) / 2
+        context.save()
+        context.translate(x, y)
+        context.scale(scale, scale)
+        Gdk.cairo_set_source_pixbuf(context, self._pixbuf, 0, 0)
+        context.paint()
+        context.restore()
+        return False
+
+
 class ResizeHandle(Gtk.EventBox):
     """Handle for resizing columns"""
 
@@ -640,7 +842,7 @@ class ResizeHandle(Gtk.EventBox):
 
 
 class PreviewPanel(Gtk.Box):
-    """Preview panel for the selected file"""
+    """Metadata inspector for the active file or directory."""
 
     def __init__(self):
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=12)
@@ -674,15 +876,7 @@ class PreviewPanel(Gtk.Box):
         self.info_grid.set_row_spacing(6)
         self.pack_start(self.info_grid, False, False, 0)
 
-        # Image preview
-        self.preview_scroll = Gtk.ScrolledWindow()
-        self.preview_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
-        self.preview_image = Gtk.Image()
-        self.preview_scroll.add(self.preview_image)
-        self.pack_start(self.preview_scroll, True, True, 0)
-
         self.show_all()
-        self.preview_scroll.hide()
 
     def update(self, item):
         """Updates the preview with item information"""
@@ -737,8 +931,6 @@ class PreviewPanel(Gtk.Box):
         # Path
         self._add_info_row("Path:", str(item.path.parent), row)
 
-        # Image preview
-        self._update_image_preview(item)
         self.info_grid.show_all()
 
     def _add_info_row(self, label_text, value_text, row):
@@ -764,32 +956,12 @@ class PreviewPanel(Gtk.Box):
             size /= 1024
         return f"{size:.1f} PB"
 
-    def _update_image_preview(self, item):
-        """Shows preview if item is an image"""
-        if item.is_dir:
-            self.preview_scroll.hide()
-            return
-
-        mime_type, _ = mimetypes.guess_type(str(item.path))
-        if mime_type and mime_type.startswith('image/'):
-            try:
-                pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_scale(
-                    str(item.path), 250, 250, True
-                )
-                self.preview_image.set_from_pixbuf(pixbuf)
-                self.preview_scroll.show()
-            except Exception:
-                self.preview_scroll.hide()
-        else:
-            self.preview_scroll.hide()
-
     def clear(self):
-        """Clears the preview panel"""
+        """Clears the metadata inspector."""
         self.icon_image.clear()
         self.name_label.set_text("")
         for child in self.info_grid.get_children():
             self.info_grid.remove(child)
-        self.preview_scroll.hide()
 
 
 @dataclass
@@ -1053,11 +1225,15 @@ class MillerColumnsContainer(Gtk.Box):
         self.column_widths = []  # Column widths (-1 = auto)
         self.reserved_child_column_index = 0
         self.width_slot_count = 1
+        self.file_preview = None
+        self.file_preview_separator = None
+        self.file_preview_source = None
 
         self.get_style_context().add_class("miller-columns-container")
 
     def add_column(self, path):
         """Adds a new column"""
+        self.clear_file_preview()
         column = ColumnView(path, self._on_item_selected, self.on_item_activated_callback)
 
         # If there are existing columns, add a resize handle
@@ -1086,6 +1262,8 @@ class MillerColumnsContainer(Gtk.Box):
         if column not in self.columns:
             return
 
+        self.clear_file_preview()
+
         idx = self.columns.index(column)
 
         # Remove columns and handles
@@ -1105,6 +1283,7 @@ class MillerColumnsContainer(Gtk.Box):
 
     def clear(self):
         """Removes all columns"""
+        self.clear_file_preview()
         for col in self.columns:
             self.remove(col)
             col.destroy()
@@ -1116,6 +1295,38 @@ class MillerColumnsContainer(Gtk.Box):
         self.column_widths.clear()
         self.reserved_child_column_index = 0
         self.width_slot_count = 1
+
+    def show_file_preview(self, column, path):
+        """Fill the reserved child slot with a non-navigation file preview."""
+        if column not in self.columns:
+            return
+        self.clear_file_preview()
+
+        separator = Gtk.Separator(orientation=Gtk.Orientation.VERTICAL)
+        separator.set_size_request(RESIZE_HANDLE_WIDTH, -1)
+        separator.get_style_context().add_class("resize-handle")
+        preview = FilePreviewColumn(path)
+
+        self.file_preview_source = column
+        self.file_preview_separator = separator
+        self.file_preview = preview
+        self.pack_start(separator, False, False, 0)
+        self.pack_start(preview, False, True, 0)
+        separator.show_all()
+        preview.show_all()
+        GLib.idle_add(self._distribute_widths)
+
+    def clear_file_preview(self):
+        """Remove the transient preview slot without changing directories."""
+        if self.file_preview is not None:
+            self.remove(self.file_preview)
+            self.file_preview.destroy()
+        if self.file_preview_separator is not None:
+            self.remove(self.file_preview_separator)
+            self.file_preview_separator.destroy()
+        self.file_preview = None
+        self.file_preview_separator = None
+        self.file_preview_source = None
 
     def _on_item_selected(self, column, item):
         """Handles selection and recalculates widths"""
@@ -1159,6 +1370,9 @@ class MillerColumnsContainer(Gtk.Box):
                 col.set_size_request(auto_width, -1)
             else:
                 col.set_size_request(self.column_widths[i], -1)
+
+        if self.file_preview is not None:
+            self.file_preview.set_size_request(auto_width, -1)
 
         return False
 
@@ -1297,6 +1511,11 @@ class MillerColumnsWindow(Gtk.ApplicationWindow):
 
         .miller-column {
             background-color: @theme_base_color;
+        }
+
+        .file-preview-column {
+            background-color: @theme_base_color;
+            border-left: 1px solid @borders;
         }
 
         .miller-column row {
@@ -1480,6 +1699,7 @@ class MillerColumnsWindow(Gtk.ApplicationWindow):
             self.current_path = item.path
         else:
             self.current_path = item.path.parent
+            self.columns_container.show_file_preview(column, item.path)
 
         self._update_path_bar()
         self.preview_panel.update(item)
@@ -1974,6 +2194,10 @@ class MillerColumnsWindow(Gtk.ApplicationWindow):
         if focused_column in self.columns_container.columns:
             active_item = focused_column.get_active_item()
             self.preview_panel.update(active_item)
+            if active_item is not None and not active_item.is_dir:
+                self.columns_container.show_file_preview(
+                    focused_column, active_item.path
+                )
             focused_column.grab_navigation_focus()
         else:
             self.preview_panel.clear()

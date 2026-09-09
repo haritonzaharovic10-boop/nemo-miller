@@ -4,10 +4,12 @@ from pathlib import Path
 
 from nemo_miller_columns import (
     FileOperationError,
+    MAX_PREVIEW_BYTES,
     calculate_auto_column_width,
     calculate_width_slot_count,
     copy_path,
     create_folder,
+    load_file_preview,
     move_path,
     rename_path,
     resolve_operation_destination,
@@ -44,6 +46,65 @@ class ColumnWidthTests(unittest.TestCase):
         slots = calculate_width_slot_count(5, 4)
 
         self.assertEqual(slots, 6)
+
+
+class FilePreviewTests(unittest.TestCase):
+    def setUp(self):
+        self.lab = tempfile.TemporaryDirectory(
+            prefix="nemo-miller-preview-", dir="/tmp"
+        )
+        self.root = Path(self.lab.name)
+
+    def tearDown(self):
+        self.lab.cleanup()
+
+    def test_plain_text_preview(self):
+        path = self.root / "notes.txt"
+        path.write_text("first\nsecond\nthird\n", encoding="utf-8")
+
+        preview = load_file_preview(path)
+
+        self.assertEqual(preview.kind, "text")
+        self.assertEqual(preview.text, "first\nsecond\nthird")
+        self.assertFalse(preview.truncated)
+
+    def test_text_preview_is_line_bounded(self):
+        path = self.root / "many.txt"
+        path.write_text(
+            "\n".join(f"line-{index}" for index in range(250)),
+            encoding="utf-8",
+        )
+
+        preview = load_file_preview(path)
+
+        self.assertEqual(preview.kind, "text")
+        self.assertEqual(len(preview.text.splitlines()), 200)
+        self.assertTrue(preview.truncated)
+
+    def test_text_preview_is_byte_bounded(self):
+        path = self.root / "large.txt"
+        path.write_bytes(b"a" * (MAX_PREVIEW_BYTES + 32))
+
+        preview = load_file_preview(path)
+
+        self.assertEqual(preview.kind, "text")
+        self.assertLessEqual(len(preview.text.encode("utf-8")), MAX_PREVIEW_BYTES)
+        self.assertTrue(preview.truncated)
+
+    def test_binary_file_is_unsupported(self):
+        path = self.root / "payload.bin"
+        path.write_bytes(b"\x00\x01\x02")
+
+        preview = load_file_preview(path)
+
+        self.assertEqual(preview.kind, "unsupported")
+
+    def test_image_is_classified_for_scaled_rendering(self):
+        asset = Path(__file__).resolve().parents[1] / "assets" / "unsupported-preview.jpeg"
+
+        preview = load_file_preview(asset)
+
+        self.assertEqual(preview.kind, "image")
 
 
 class FileOperationLabTests(unittest.TestCase):
