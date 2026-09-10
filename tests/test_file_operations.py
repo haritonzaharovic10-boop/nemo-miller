@@ -11,11 +11,54 @@ from nemo_miller_columns import (
     create_folder,
     load_file_preview,
     move_path,
+    parse_file_uri_list,
+    parse_gnome_file_clipboard,
     rename_path,
     resolve_operation_destination,
     resolve_operation_paths,
+    serialize_gnome_file_clipboard,
     trash_path,
 )
+
+
+class SystemClipboardFormatTests(unittest.TestCase):
+    def test_gnome_file_clipboard_round_trip_preserves_mode_and_order(self):
+        paths = (
+            Path("/tmp/one file.txt"),
+            Path("/tmp/тест.json"),
+        )
+
+        payload = serialize_gnome_file_clipboard("cut", paths)
+        mode, parsed_paths = parse_gnome_file_clipboard(payload)
+
+        self.assertEqual(mode, "cut")
+        self.assertEqual(parsed_paths, paths)
+
+    def test_gnome_payload_has_no_empty_uri_for_nemo_parser(self):
+        payload = serialize_gnome_file_clipboard(
+            "copy", (Path("/tmp/one.txt"), Path("/tmp/two.txt"))
+        )
+        lines = payload.decode("utf-8").split("\n")
+
+        self.assertEqual(lines[0], "copy")
+        self.assertEqual(len(lines[1:]), 2)
+        self.assertNotIn("", lines[1:])
+        self.assertFalse(payload.endswith(b"\n"))
+
+    def test_uri_list_ignores_comments_and_blank_lines(self):
+        paths = parse_file_uri_list(
+            "# copied files\nfile:///tmp/one.txt\n\nfile:///tmp/two.txt\r\n"
+        )
+
+        self.assertEqual(paths, (Path("/tmp/one.txt"), Path("/tmp/two.txt")))
+
+    def test_remote_clipboard_uri_is_rejected(self):
+        with self.assertRaises(FileOperationError):
+            parse_file_uri_list("https://example.com/file.txt")
+
+    def test_invalid_gnome_clipboard_mode_is_rejected(self):
+        with self.assertRaises(FileOperationError):
+            parse_gnome_file_clipboard(b"link\nfile:///tmp/one.txt\n")
 
 
 class ColumnWidthTests(unittest.TestCase):

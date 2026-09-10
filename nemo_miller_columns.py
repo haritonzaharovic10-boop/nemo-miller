@@ -31,6 +31,10 @@ MAX_PREVIEW_LINES = 200
 UNSUPPORTED_PREVIEW_IMAGE = (
     Path(__file__).resolve().parent / "assets" / "unsupported-preview.jpeg"
 )
+GNOME_COPIED_FILES_NAME = "x-special/gnome-copied-files"
+URI_LIST_NAME = "text/uri-list"
+GNOME_COPIED_FILES_INFO = 1
+URI_LIST_INFO = 2
 
 
 class FileOperationError(Exception):
@@ -50,6 +54,47 @@ def resolve_operation_paths(marked_paths, active_path):
     if active_path is None:
         return ()
     return (Path(active_path),)
+
+
+def serialize_gnome_file_clipboard(mode, paths):
+    """Serialize paths using the GNOME/Nemo copied-files convention."""
+    if mode not in (CLIPBOARD_COPY, CLIPBOARD_CUT):
+        raise ValueError(f"Unsupported clipboard mode: {mode}")
+    lines = [mode]
+    lines.extend(Path(path).resolve().as_uri() for path in paths)
+    # Nemo splits every line after mode into a URI, including a trailing empty
+    # line. Never append a final newline: it would become an invalid "" path.
+    return "\n".join(lines).encode("utf-8")
+
+
+def parse_file_uri_list(text):
+    """Parse local file URIs from clipboard text in visible order."""
+    paths = []
+    for raw_line in text.replace("\r\n", "\n").split("\n"):
+        uri = raw_line.strip()
+        if not uri or uri.startswith("#"):
+            continue
+        parsed = urllib.parse.urlsplit(uri)
+        if parsed.scheme != "file" or parsed.netloc not in ("", "localhost"):
+            raise FileOperationError(f"Unsupported clipboard URI: {uri}")
+        paths.append(Path(urllib.parse.unquote(parsed.path)))
+    return tuple(paths)
+
+
+def parse_gnome_file_clipboard(data):
+    """Return mode and ordered local paths from GNOME copied-files data."""
+    if isinstance(data, bytes):
+        text = data.rstrip(b"\x00").decode("utf-8", errors="strict")
+    else:
+        text = str(data)
+    lines = text.replace("\r\n", "\n").split("\n")
+    if not lines or lines[0].strip() not in (CLIPBOARD_COPY, CLIPBOARD_CUT):
+        raise FileOperationError("Clipboard does not contain a valid file operation")
+    mode = lines[0].strip()
+    paths = parse_file_uri_list("\n".join(lines[1:]))
+    if not paths:
+        raise FileOperationError("Clipboard file list is empty")
+    return mode, paths
 
 
 def resolve_operation_destination(column_path, active_path, active_is_directory):
@@ -1433,6 +1478,30 @@ class MillerColumnsWindow(Gtk.ApplicationWindow):
         # intentionally out of scope for this tranche.
         self.clipboard_mode = None
         self.clipboard_paths = ()
+        self.clipboard_selection = Gdk.SELECTION_CLIPBOARD
+        self.gnome_copied_files_target = Gdk.Atom.intern(
+            GNOME_COPIED_FILES_NAME, False
+        )
+        self.uri_list_target = Gdk.Atom.intern(URI_LIST_NAME, False)
+        self.clipboard_owner = Gtk.Invisible()
+        self.clipboard_owner.connect(
+            "selection-get", self._on_clipboard_selection_get
+        )
+        self.clipboard_owner.connect(
+            "selection-clear-event", self._on_clipboard_selection_clear
+        )
+        Gtk.selection_add_target(
+            self.clipboard_owner,
+            self.clipboard_selection,
+            self.gnome_copied_files_target,
+            GNOME_COPIED_FILES_INFO,
+        )
+        Gtk.selection_add_target(
+            self.clipboard_owner,
+            self.clipboard_selection,
+            self.uri_list_target,
+            URI_LIST_INFO,
+        )
 
         # GTK may undo focus changes made during key-press CAPTURE. Hold one
         # replaceable target until key release, with one idle fallback for
@@ -2001,24 +2070,111 @@ class MillerColumnsWindow(Gtk.ApplicationWindow):
         """Snapshot focused-column targets without changing their marks."""
         paths = column.get_operation_paths()
         if paths:
-            self.clipboard_mode = mode
-            self.clipboard_paths = paths
+            self._publish_file_clipboard(mode, paths)
+
+    def _publish_file_clipboard(self, mode, paths):
+        """Own the X11 clipboard and advertise GNOME/Nemo file targets."""
+        paths = tuple(Path(path) for path in paths)
+        owned = Gtk.selection_owner_set(
+            self.clipboard_owner,
+            self.clipboard_selection,
+            Gdk.CURRENT_TIME,
+        )
+        self.clipboard_mode = mode
+        self.clipboard_paths = paths
+        if not owned:
+            self._show_error(
+                "Clipboard unavailable",
+                "Could not publish files to the desktop clipboard."
+            )
+
+    def _on_clipboard_selection_get(self, widget, selection_data, info, time_):
+        """Provide advertised file data when another application requests it."""
+        if not self.clipboard_paths or self.clipboard_mode is None:
+            return
+        if info == GNOME_COPIED_FILES_INFO:
+            payload = serialize_gnome_file_clipboard(
+                self.clipboard_mode, self.clipboard_paths
+            )
+            selection_data.set(
+                self.gnome_copied_files_target, 8, payload
+            )
+        elif info == URI_LIST_INFO:
+            selection_data.set_uris([
+                path.resolve().as_uri() for path in self.clipboard_paths
+            ])
+
+    def _on_clipboard_selection_clear(self, widget, event):
+        """Drop stale internal state when another owner replaces clipboard."""
+        self.clipboard_mode = None
+        self.clipboard_paths = ()
+        return False
 
     def _paste_clipboard(self, column):
-        """Copy or move staged paths into the focused operation destination."""
-        if self.clipboard_mode not in (CLIPBOARD_COPY, CLIPBOARD_CUT):
-            return
-        if not self.clipboard_paths:
-            return
-
+        """Request external file targets, falling back to in-app state."""
         destination_directory = column.get_operation_destination()
+        clipboard = Gtk.Clipboard.get(self.clipboard_selection)
+        clipboard.request_targets(
+            self._on_clipboard_targets_received,
+            destination_directory,
+        )
+
+    def _on_clipboard_targets_received(self, clipboard, targets, n_targets,
+                                       destination_directory):
+        """Choose the richest supported external file clipboard format."""
+        targets = tuple((targets or ())[:n_targets])
+        if self.gnome_copied_files_target in targets:
+            clipboard.request_contents(
+                self.gnome_copied_files_target,
+                self._on_clipboard_contents_received,
+                (destination_directory, GNOME_COPIED_FILES_INFO),
+            )
+            return
+        if self.uri_list_target in targets:
+            clipboard.request_contents(
+                self.uri_list_target,
+                self._on_clipboard_contents_received,
+                (destination_directory, URI_LIST_INFO),
+            )
+            return
+        if (self.clipboard_mode in (CLIPBOARD_COPY, CLIPBOARD_CUT) and
+                self.clipboard_paths):
+            self._execute_paste(
+                self.clipboard_mode,
+                self.clipboard_paths,
+                destination_directory,
+            )
+
+    def _on_clipboard_contents_received(self, clipboard, selection_data,
+                                        context):
+        """Parse external file targets and execute the existing paste path."""
+        destination_directory, target_info = context
+        try:
+            if target_info == GNOME_COPIED_FILES_INFO:
+                mode, paths = parse_gnome_file_clipboard(
+                    selection_data.get_data()
+                )
+            else:
+                uris = selection_data.get_uris() or ()
+                mode = CLIPBOARD_COPY
+                paths = parse_file_uri_list("\n".join(uris))
+                if not paths:
+                    raise FileOperationError("Clipboard file list is empty")
+        except (FileOperationError, UnicodeError) as error:
+            self._show_error("Paste failed", str(error))
+            return
+        self._execute_paste(mode, paths, destination_directory)
+
+    def _execute_paste(self, mode, clipboard_paths, destination_directory):
+        """Copy or move parsed clipboard paths into a resolved destination."""
+        clipboard_paths = tuple(Path(path) for path in clipboard_paths)
         failures = []
         succeeded = []
         affected_directories = {destination_directory}
-        operation = copy_path if self.clipboard_mode == CLIPBOARD_COPY else move_path
+        operation = copy_path if mode == CLIPBOARD_COPY else move_path
 
-        for source in self.clipboard_paths:
-            if self.clipboard_mode == CLIPBOARD_CUT:
+        for source in clipboard_paths:
+            if mode == CLIPBOARD_CUT:
                 affected_directories.add(source.parent)
             try:
                 operation(source, destination_directory)
@@ -2031,13 +2187,21 @@ class MillerColumnsWindow(Gtk.ApplicationWindow):
         # operation may have created a partial destination before reporting it.
         self._refresh_after_mutation(affected_directories)
 
-        if self.clipboard_mode == CLIPBOARD_CUT:
+        if mode == CLIPBOARD_CUT:
             failed_paths = {path for path, _message in failures}
-            self.clipboard_paths = tuple(
-                path for path in self.clipboard_paths if path in failed_paths
+            remaining_paths = tuple(
+                path for path in clipboard_paths if path in failed_paths
             )
-            if not self.clipboard_paths:
+            if remaining_paths:
+                self._publish_file_clipboard(CLIPBOARD_CUT, remaining_paths)
+            else:
                 self.clipboard_mode = None
+                self.clipboard_paths = ()
+                Gtk.selection_owner_set(
+                    None,
+                    self.clipboard_selection,
+                    Gdk.CURRENT_TIME,
+                )
 
         self._show_operation_failures("Paste failed", failures)
 
