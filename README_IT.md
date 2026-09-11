@@ -1,182 +1,165 @@
-# Nemo Miller Columns
+# Miller Columns
 
-Un'estensione per Nemo (file manager di Linux Mint/Cinnamon) che permette di visualizzare i file in stile **Miller Columns**, simile al Finder di macOS.
+Un file manager GTK 3 orientato alla tastiera e basato sulla visualizzazione a
+colonne Miller. Funziona come applicazione autonoma e può, facoltativamente,
+diventare il gestore predefinito delle cartelle per l'utente corrente.
 
-[Miller Columns](https://en.wikipedia.org/wiki/Miller_columns)
+Il progetto nasce come fork di
+[linux-nemo-miller-columns](https://github.com/davemin/linux-nemo-miller-columns).
 
 *[Read in English](README.md)*
 
-## Caratteristiche
+## Funzionalità
 
-- **Vista Miller Columns**: Naviga le cartelle in colonne affiancate
-- **Colonne ridimensionabili**: Trascina i separatori per regolare la larghezza delle colonne
-- **Distribuzione equa**: Le colonne si distribuiscono automaticamente in modo equo (es. 4 colonne = 25% ciascuna)
-- **Ricerca file**: Cerca per nome file E contenuto, ricorsivamente nelle sottocartelle
-- **Pannello di anteprima**: Mostra informazioni e anteprima del file selezionato
-- **Integrazione con Nemo**: Click destro → "Apri in Miller Columns"
-- **Navigazione rapida**: Barra del percorso cliccabile, pulsanti home e indietro
-- **Anteprima immagini**: Visualizza miniature delle immagini
-- **Apri in terminale**: Pulsante per aprire un terminale nella cartella corrente
-- **Scorciatoie da tastiera**: Ctrl+F per cercare, Backspace per tornare indietro, Esc per chiudere
+- Colonne Miller stabili e ridimensionabili con anteprima della cartella figlia.
+- Navigazione nativa Up/Down e navigazione esplicita tra colonne con Left/Right.
+- Elemento attivo separato dagli elementi marcati per operazioni multiple.
+- Space modifica un marcatore, Shift estende un intervallo e Ctrl+A marca tutta
+  la colonna.
+- Copia, taglia, incolla, rinomina, nuova cartella e spostamento nel Cestino.
+- Clipboard file compatibile con GNOME/Nemo.
+- Drag and drop multiplo in entrata e in uscita.
+- Anteprime di testo e immagini con limiti di lettura.
+- Pannello metadati, ricerca ricorsiva, breadcrumb e azioni terminale/Nemo.
+- Nessuna eliminazione permanente e nessuna sovrascrittura silenziosa.
 
 ## Requisiti
 
-- Linux Mint 22 (o altra distribuzione con Nemo)
-- Nemo 6.x
-- Python 3
-- GTK 3
-- nemo-python (per l'estensione)
+- Python 3.10 o successivo.
+- GTK 3 e PyGObject (`python3-gi` nelle distribuzioni della famiglia Debian).
+- Dati di introspezione GTK, GdkPixbuf e Gio.
+- `xdg-utils` solo per `install.sh --default`.
+- Nemo e `nemo-python` sono opzionali e servono soltanto per la vecchia
+  estensione del menu contestuale.
 
-## Installazione
+Le dipendenze non vengono installate automaticamente. Se manca qualcosa, usa
+il package manager della tua distribuzione Linux.
 
-### Automatica (consigliata)
+## Avvio dal sorgente
 
 ```bash
-cd /percorso/di/nemo-miller-columns
+python3 nemo_miller_columns.py
+python3 nemo_miller_columns.py /percorso/della/cartella
+```
+
+Senza percorso viene aperta la home dell'utente corrente.
+
+## Installazione per l'utente
+
+Installa l'applicazione autonoma e il launcher senza cambiare il file manager
+predefinito:
+
+```bash
 ./install.sh
 ```
 
-Lo script installerà automaticamente le dipendenze mancanti.
-
-### Manuale
-
-1. **Installa le dipendenze**:
+Per impostare esplicitamente Miller Columns come gestore predefinito delle
+cartelle per l'utente corrente:
 
 ```bash
-sudo apt update
-sudo apt install python3 python3-gi gir1.2-gtk-3.0 nemo-python
+./install.sh --default
 ```
 
-2. **Crea le directory**:
+L'installer:
+
+- non usa mai `sudo`;
+- non installa nulla in `/usr`;
+- non installa né riavvia l'estensione Nemo;
+- salva il gestore precedente prima di modificarlo;
+- installa soltanto in `${XDG_DATA_HOME:-~/.local/share}`.
+
+Disinstallazione:
 
 ```bash
-mkdir -p ~/.local/share/nemo-miller-columns
-mkdir -p ~/.local/share/nemo-python/extensions
-```
-
-3. **Copia i file**:
-
-```bash
-# Applicazione principale
-cp nemo_miller_columns.py ~/.local/share/nemo-miller-columns/
-chmod +x ~/.local/share/nemo-miller-columns/nemo_miller_columns.py
-
-# Estensione Nemo
-cp nemo-miller-columns-extension.py ~/.local/share/nemo-python/extensions/
-```
-
-4. **Riavvia Nemo**:
-
-```bash
-nemo -q
-```
-
-## Utilizzo
-
-### Da Nemo (menu contestuale)
-
-1. Apri Nemo e naviga in una cartella
-2. Click destro su una cartella **oppure** sullo sfondo vuoto
-3. Seleziona **"Apri in Miller Columns"**
-
-### Da terminale
-
-```bash
-python3 ~/.local/share/nemo-miller-columns/nemo_miller_columns.py [percorso]
-```
-
-Esempi:
-```bash
-# Apri la home
-python3 ~/.local/share/nemo-miller-columns/nemo_miller_columns.py
-
-# Apri una cartella specifica
-python3 ~/.local/share/nemo-miller-columns/nemo_miller_columns.py /home/utente/Documenti
-```
-
-## Scorciatoie da tastiera
-
-| Tasto | Azione |
-|-------|--------|
-| `Ctrl+F` | Focus sulla barra di ricerca |
-| `Esc` | Esci dalla ricerca / Chiudi applicazione |
-| `Backspace` | Vai alla cartella padre |
-| `Enter` / Doppio click su file | Apri con applicazione predefinita |
-| `Enter` / Click su cartella | Naviga nella cartella |
-
-## Ricerca
-
-La barra di ricerca permette di trovare file per nome o contenuto:
-
-- **Ricerca live**: I risultati appaiono mentre digiti (con debounce di 300ms)
-- **Ricorsiva**: Cerca in tutte le sottocartelle dalla posizione corrente
-- **Ricerca contenuto**: Cerca anche dentro i file di testo (salta file > 10MB)
-- **Indicatore match**: Mostra badge "in content" per i match nel contenuto
-- Clicca su un risultato per navigare e aprire il file
-
-## Ridimensionamento Colonne
-
-- **Distribuzione automatica**: Le colonne si distribuiscono automaticamente in modo equo
-- **Ridimensionamento manuale**: Trascina i separatori verticali tra le colonne per regolare le larghezze
-- **Larghezza minima**: Ogni colonna ha una larghezza minima di 100px
-- **Feedback visivo**: Il cursore cambia quando passi sopra i separatori
-
-## Struttura del progetto
-
-```
-nemo-miller-columns/
-├── nemo_miller_columns.py           # Applicazione principale GTK
-├── nemo-miller-columns-extension.py # Estensione per menu Nemo
-├── install.sh                       # Script di installazione
-├── uninstall.sh                     # Script di disinstallazione
-├── README.md                        # Documentazione in inglese
-└── README_IT.md                     # Documentazione in italiano
-```
-
-## Disinstallazione
-
-```bash
-cd /percorso/di/nemo-miller-columns
 ./uninstall.sh
 ```
 
-## Risoluzione problemi
+Se `--default` ha registrato un gestore precedente, l'uninstaller lo ripristina.
+Nemo di sistema non viene mai rimosso o modificato.
 
-### L'opzione non appare nel menu contestuale
+## Tastiera e mouse
 
-1. Assicurati che `nemo-python` sia installato:
-   ```bash
-   sudo apt install nemo-python
-   ```
+| Input | Azione |
+|---|---|
+| `Up` / `Down` | Sposta l'elemento attivo nella colonna corrente |
+| `Left` | Passa alla colonna Miller precedente |
+| `Right` / `Enter` | Entra nella cartella attiva o apre il file attivo |
+| `Backspace` | Va alla cartella padre nel filesystem |
+| `Space` | Aggiunge/rimuove il marcatore dell'elemento attivo |
+| `Shift+Up/Down` | Estende l'intervallo marcato |
+| `Ctrl+A` | Marca tutti gli elementi della colonna corrente |
+| `Ctrl+C` / `Ctrl+X` / `Ctrl+V` | Copia, taglia e incolla |
+| `F2` | Rinomina un singolo elemento attivo/marcato |
+| `Delete` | Sposta gli elementi attivi/marcati nel Cestino |
+| `Ctrl+Shift+N` | Crea una cartella nella destinazione attiva |
+| `Ctrl+F` | Porta il focus sulla ricerca |
+| `Esc` | Esce dalla ricerca, cancella i marcatori, poi chiude |
+| Click | Rende attivo un elemento; un file diventa l'unico marcato |
+| `Ctrl+Click` | Aggiunge/rimuove un marcatore |
+| `Shift+Click` | Marca un intervallo |
+| Doppio click | Entra in una cartella o apre un file |
 
-2. Verifica che l'estensione sia nella cartella corretta:
-   ```bash
-   ls ~/.local/share/nemo-python/extensions/
-   ```
+L'elemento attivo controlla anteprima e navigazione. Gli elementi marcati sono
+soltanto obiettivi delle operazioni: marcare più cartelle non crea colonne
+figlie in competizione.
 
-3. Riavvia Nemo completamente:
-   ```bash
-   nemo -q
-   nemo &
-   ```
+## Operazioni sui file
 
-4. Se ancora non funziona, prova a riavviare il sistema.
+- Viene usato prima l'insieme marcato; in sua assenza, l'elemento attivo.
+- Incolla/nuova cartella usa la cartella attiva oppure la directory della
+  colonna quando l'elemento attivo è un file o non esiste.
+- Le directory vengono copiate ricorsivamente e i link simbolici sono
+  preservati quando possibile.
+- Una destinazione esistente viene rifiutata, mai sovrascritta.
+- È vietato copiare o spostare una cartella dentro sé stessa o un discendente.
+- `Delete` usa il Cestino Gio senza fallback a eliminazione permanente.
+- Dopo un taglio parzialmente fallito, i percorsi falliti restano in clipboard.
 
-### Errore "Nemo module not found"
+## Limiti noti
 
-Il modulo `gi.repository.Nemo` è disponibile solo all'interno di Nemo. L'estensione funzionerà correttamente quando caricata da Nemo stesso.
+- Undo/redo non è ancora disponibile.
+- Non esiste un monitor generale del filesystem: le operazioni interne
+  aggiornano le colonne visibili, mentre i cambiamenti esterni possono
+  richiedere una nuova navigazione.
+- Copie/spostamenti ricorsivi e alcune anteprime possono bloccare il thread GTK.
+- Clipboard e drag/drop accettano soltanto percorsi locali `file://`.
+- Cancellazione e risultati obsoleti della ricerca richiedono ulteriore lavoro.
+- Un desktop che usa un'API D-Bus privata può ignorare l'associazione standard
+  `inode/directory`.
 
-### L'applicazione non si avvia
+## Sviluppo
 
-Verifica che GTK 3 sia installato correttamente:
+Test senza display:
+
 ```bash
-python3 -c "import gi; gi.require_version('Gtk', '3.0'); from gi.repository import Gtk; print('OK')"
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
 ```
+
+Controllo sintattico senza bytecode nel repository:
+
+```bash
+PYTHONPYCACHEPREFIX=/tmp/miller-columns-pycache \
+python3 -m py_compile nemo_miller_columns.py \
+  nemo-miller-columns-extension.py tests/*.py
+```
+
+I test del filesystem usano directory temporanee dedicate in `/tmp`. Non usare
+dati personali per provare operazioni mutanti.
+
+## Struttura del repository
+
+```text
+assets/                            Immagine fallback delle anteprime
+nemo_miller_columns.py             Applicazione GTK autonoma
+nemo-miller-columns-extension.py   Sorgente opzionale della vecchia estensione
+tests/                              Test della libreria standard
+install.sh                          Installer autonomo e sicuro per utente
+uninstall.sh                        Uninstaller per utente
+```
+
+L'immagine fallback è stata generata appositamente per questo progetto ed è
+distribuita con la licenza MIT del repository.
 
 ## Licenza
 
-MIT License - Sei libero di usare, modificare e distribuire questo software.
-
-## Contributi
-
-Contributi, bug reports e feature requests sono benvenuti!
+[MIT](LICENSE). L'avviso di copyright originale è conservato.

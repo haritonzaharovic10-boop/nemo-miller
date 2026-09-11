@@ -1,64 +1,50 @@
-#!/bin/bash
-#
-# Uninstallation script for Nemo Miller Columns
-#
+#!/usr/bin/env bash
 
-set -e
+set -eu
 
-# Colors for output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-NC='\033[0m' # No Color
+data_home="${XDG_DATA_HOME:-$HOME/.local/share}"
+app_dir="$data_home/miller-columns"
+desktop_dir="$data_home/applications"
+desktop_file="$desktop_dir/miller-columns.desktop"
+previous_handler_file="$app_dir/previous-directory-handler"
 
-echo -e "${YELLOW}========================================${NC}"
-echo -e "${YELLOW}  Nemo Miller Columns - Uninstallation ${NC}"
-echo -e "${YELLOW}========================================${NC}"
-echo ""
+printf 'Uninstall Miller Columns from %s? [y/N] ' "$app_dir"
+read -r reply
+case "$reply" in
+    y|Y|yes|YES)
+        ;;
+    *)
+        printf '%s\n' "Uninstallation cancelled."
+        exit 0
+        ;;
+esac
 
-# Installation directories
-APP_DIR="$HOME/.local/share/nemo-miller-columns"
-EXTENSION_DIR="$HOME/.local/share/nemo-python/extensions"
-DESKTOP_DIR="$HOME/.local/share/applications"
-
-# Confirmation
-read -p "Are you sure you want to uninstall Nemo Miller Columns? [y/N] " -n 1 -r
-echo
-if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-    echo "Uninstallation cancelled."
-    exit 0
+current_handler=""
+if command -v xdg-mime >/dev/null 2>&1; then
+    current_handler=$(xdg-mime query default inode/directory 2>/dev/null || true)
 fi
 
-echo ""
-
-# Remove application
-if [ -d "$APP_DIR" ]; then
-    echo -e "${YELLOW}Removing application...${NC}"
-    rm -rf "$APP_DIR"
-    echo -e "${GREEN}Application removed.${NC}"
+if [ "$current_handler" = "miller-columns.desktop" ]; then
+    if [ -s "$previous_handler_file" ]; then
+        previous_handler=$(sed -n '1p' "$previous_handler_file")
+        xdg-mime default "$previous_handler" inode/directory
+        printf 'Restored default directory handler: %s\n' "$previous_handler"
+    else
+        printf '%s\n' \
+            "Warning: no previous directory handler was recorded." \
+            "Choose another default file manager after uninstalling." >&2
+    fi
 fi
 
-# Remove extension
-if [ -f "$EXTENSION_DIR/nemo-miller-columns-extension.py" ]; then
-    echo -e "${YELLOW}Removing Nemo extension...${NC}"
-    rm -f "$EXTENSION_DIR/nemo-miller-columns-extension.py"
-    echo -e "${GREEN}Extension removed.${NC}"
+if [ -f "$desktop_file" ]; then
+    rm "$desktop_file"
+fi
+if [ -d "$app_dir" ]; then
+    rm -r "$app_dir"
 fi
 
-# Remove launcher
-if [ -f "$DESKTOP_DIR/nemo-miller-columns.desktop" ]; then
-    echo -e "${YELLOW}Removing launcher...${NC}"
-    rm -f "$DESKTOP_DIR/nemo-miller-columns.desktop"
-    update-desktop-database "$DESKTOP_DIR" 2>/dev/null || true
-    echo -e "${GREEN}Launcher removed.${NC}"
+if command -v update-desktop-database >/dev/null 2>&1; then
+    update-desktop-database "$desktop_dir"
 fi
 
-# Restart Nemo
-echo -e "${YELLOW}Restarting Nemo...${NC}"
-nemo -q 2>/dev/null || true
-
-echo ""
-echo -e "${GREEN}========================================${NC}"
-echo -e "${GREEN}  Uninstallation complete!             ${NC}"
-echo -e "${GREEN}========================================${NC}"
-echo ""
+printf '%s\n' "Miller Columns was removed."

@@ -162,7 +162,10 @@ class FilePreviewTests(unittest.TestCase):
         self.assertEqual(preview.kind, "unsupported")
 
     def test_image_is_classified_for_scaled_rendering(self):
-        asset = Path(__file__).resolve().parents[1] / "assets" / "unsupported-preview.jpeg"
+        asset = (
+            Path(__file__).resolve().parents[1] /
+            "assets" / "unsupported-preview-original.png"
+        )
 
         preview = load_file_preview(asset)
 

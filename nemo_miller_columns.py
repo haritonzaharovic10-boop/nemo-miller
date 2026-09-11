@@ -29,7 +29,8 @@ RESIZE_HANDLE_WIDTH = 6
 MAX_PREVIEW_BYTES = 256 * 1024
 MAX_PREVIEW_LINES = 200
 UNSUPPORTED_PREVIEW_IMAGE = (
-    Path(__file__).resolve().parent / "assets" / "unsupported-preview.jpeg"
+    Path(__file__).resolve().parent /
+    "assets" / "unsupported-preview-original.png"
 )
 GNOME_COPIED_FILES_NAME = "x-special/gnome-copied-files"
 URI_LIST_NAME = "text/uri-list"
@@ -738,7 +739,7 @@ class ColumnView(Gtk.Box):
         return had_marks
 
     def get_marked_items(self):
-        """Returns marked items in visible row order for future operations."""
+        """Returns marked items in visible row order for file operations."""
         return [
             row.item for row in self.listbox.get_children()
             if hasattr(row, 'item') and row.item.path in self.marked_paths
@@ -1599,8 +1600,7 @@ class MillerColumnsWindow(Gtk.ApplicationWindow):
         self.search_thread = None
         self.search_timeout_id = None
 
-        # Small in-application clipboard; desktop clipboard integration is
-        # intentionally out of scope for this tranche.
+        # Application-owned file clipboard with GNOME/Nemo interoperability.
         self.clipboard_mode = None
         self.clipboard_paths = ()
         self.clipboard_selection = Gdk.SELECTION_CLIPBOARD

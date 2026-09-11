@@ -1,121 +1,106 @@
-#!/bin/bash
-#
-# Installation script for Nemo Miller Columns
-# For Linux Mint 22 with Nemo 6.4.x
-#
+#!/usr/bin/env bash
 
-set -e
+set -eu
 
-# Colors for output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-NC='\033[0m' # No Color
+usage() {
+    printf '%s\n' \
+        "Usage: ./install.sh [--default]" \
+        "" \
+        "Installs Miller Columns for the current user." \
+        "  --default  Also make it the default inode/directory handler."
+}
 
-echo -e "${GREEN}========================================${NC}"
-echo -e "${GREEN}  Nemo Miller Columns - Installation   ${NC}"
-echo -e "${GREEN}========================================${NC}"
-echo ""
+set_default=false
+for argument in "$@"; do
+    case "$argument" in
+        --default)
+            set_default=true
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            printf 'Unknown option: %s\n\n' "$argument" >&2
+            usage >&2
+            exit 2
+            ;;
+    esac
+done
 
-# Installation directories
-APP_DIR="$HOME/.local/share/nemo-miller-columns"
-EXTENSION_DIR="$HOME/.local/share/nemo-python/extensions"
-DESKTOP_DIR="$HOME/.local/share/applications"
-
-# 1. Check dependencies
-echo -e "${YELLOW}[1/5] Checking dependencies...${NC}"
-
-MISSING_DEPS=""
-
-# Check python3
-if ! command -v python3 &> /dev/null; then
-    MISSING_DEPS="$MISSING_DEPS python3"
+if ! command -v python3 >/dev/null 2>&1; then
+    printf '%s\n' "Error: python3 is required." >&2
+    exit 1
 fi
+python_path=$(command -v python3)
 
-# Check nemo
-if ! command -v nemo &> /dev/null; then
-    echo -e "${RED}Error: Nemo not found. This script is for systems with Nemo file manager.${NC}"
+if ! "$python_path" -c "import gi; gi.require_version('Gtk', '3.0'); gi.require_version('GdkPixbuf', '2.0'); from gi.repository import GdkPixbuf, Gio, Gtk" >/dev/null 2>&1; then
+    printf '%s\n' \
+        "Error: GTK 3 Python introspection bindings are required." \
+        "Install Python 3, PyGObject, GTK 3 and GdkPixbuf using your distribution's package manager." >&2
     exit 1
 fi
 
-# Check GTK and other Python dependencies
-python3 -c "import gi; gi.require_version('Gtk', '3.0')" 2>/dev/null || MISSING_DEPS="$MISSING_DEPS gir1.2-gtk-3.0"
-python3 -c "import gi; gi.require_version('Nemo', '3.0')" 2>/dev/null || MISSING_DEPS="$MISSING_DEPS nemo-python"
-
-if [ -n "$MISSING_DEPS" ]; then
-    echo -e "${YELLOW}Missing dependencies:$MISSING_DEPS${NC}"
-    echo ""
-    echo -e "${YELLOW}Installing dependencies with apt...${NC}"
-    sudo apt update
-    sudo apt install -y python3 python3-gi gir1.2-gtk-3.0 nemo-python
-    echo ""
+if "$set_default" && ! command -v xdg-mime >/dev/null 2>&1; then
+    printf '%s\n' "Error: xdg-mime is required for --default." >&2
+    exit 1
 fi
 
-echo -e "${GREEN}All dependencies satisfied.${NC}"
-echo ""
+script_dir="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+data_home="${XDG_DATA_HOME:-$HOME/.local/share}"
+app_dir="$data_home/miller-columns"
+desktop_dir="$data_home/applications"
+desktop_file="$desktop_dir/miller-columns.desktop"
+previous_handler_file="$app_dir/previous-directory-handler"
 
-# 2. Create directories
-echo -e "${YELLOW}[2/5] Creating directories...${NC}"
-mkdir -p "$APP_DIR"
-mkdir -p "$EXTENSION_DIR"
-mkdir -p "$DESKTOP_DIR"
-echo -e "${GREEN}Directories created.${NC}"
-echo ""
+mkdir -p "$app_dir/assets" "$desktop_dir"
+cp "$script_dir/nemo_miller_columns.py" "$app_dir/nemo_miller_columns.py"
+cp "$script_dir/assets/unsupported-preview-original.png" \
+    "$app_dir/assets/unsupported-preview-original.png"
+chmod 755 "$app_dir/nemo_miller_columns.py"
 
-# 3. Copy application files
-echo -e "${YELLOW}[3/5] Installing application...${NC}"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Escape backslashes and quotes for a quoted Desktop Entry Exec argument.
+escaped_app_path=$(printf '%s' "$app_dir/nemo_miller_columns.py" | \
+    sed 's/\\/\\\\/g; s/"/\\"/g')
 
-cp "$SCRIPT_DIR/nemo_miller_columns.py" "$APP_DIR/"
-chmod +x "$APP_DIR/nemo_miller_columns.py"
-echo -e "${GREEN}Application installed in $APP_DIR${NC}"
-echo ""
-
-# 4. Install Nemo extension
-echo -e "${YELLOW}[4/5] Installing Nemo extension...${NC}"
-cp "$SCRIPT_DIR/nemo-miller-columns-extension.py" "$EXTENSION_DIR/"
-echo -e "${GREEN}Extension installed in $EXTENSION_DIR${NC}"
-echo ""
-
-# 5. Create .desktop file
-echo -e "${YELLOW}[5/5] Creating launcher...${NC}"
-cat > "$DESKTOP_DIR/nemo-miller-columns.desktop" << EOF
+cat > "$desktop_file" <<EOF
 [Desktop Entry]
-Name=Nemo Miller Columns
-Comment=Miller Columns file viewer
-Exec=python3 $APP_DIR/nemo_miller_columns.py %U
+Version=1.0
+Type=Application
+Name=Miller Columns
+GenericName=File Manager
+Comment=Keyboard-first Miller columns file manager
+Exec=$python_path "$escaped_app_path" %U
+TryExec=$python_path
 Icon=view-column-symbolic
 Terminal=false
-Type=Application
-Categories=Utility;FileTools;FileManager;
+Categories=System;FileTools;FileManager;
+Keywords=file;manager;miller;columns;
 MimeType=inode/directory;
-Keywords=file;manager;miller;columns;finder;
+StartupNotify=true
 EOF
+chmod 755 "$desktop_file"
 
-# Update desktop database
-update-desktop-database "$DESKTOP_DIR" 2>/dev/null || true
+if command -v desktop-file-validate >/dev/null 2>&1; then
+    desktop-file-validate "$desktop_file"
+fi
+if command -v update-desktop-database >/dev/null 2>&1; then
+    update-desktop-database "$desktop_dir"
+fi
 
-echo -e "${GREEN}Launcher created.${NC}"
-echo ""
+if "$set_default"; then
+    previous_handler=$(xdg-mime query default inode/directory 2>/dev/null || true)
+    if [ -n "$previous_handler" ] && \
+            [ "$previous_handler" != "miller-columns.desktop" ]; then
+        printf '%s\n' "$previous_handler" > "$previous_handler_file"
+    fi
+    xdg-mime default miller-columns.desktop inode/directory
+fi
 
-# Restart Nemo to load the extension
-echo -e "${YELLOW}Restarting Nemo to load the extension...${NC}"
-nemo -q 2>/dev/null || true
-sleep 1
-
-echo ""
-echo -e "${GREEN}========================================${NC}"
-echo -e "${GREEN}  Installation complete!               ${NC}"
-echo -e "${GREEN}========================================${NC}"
-echo ""
-echo "How to use:"
-echo "  1. Open Nemo and navigate to a folder"
-echo "  2. Right-click on a folder or on the background"
-echo "  3. Select 'Open in Miller Columns'"
-echo ""
-echo "Or launch directly:"
-echo "  python3 $APP_DIR/nemo_miller_columns.py [path]"
-echo ""
-echo -e "${YELLOW}Note: If the option doesn't appear in the menu, restart your system or run:${NC}"
-echo "  nemo -q && nemo"
-echo ""
+printf 'Installed Miller Columns in %s\n' "$app_dir"
+printf 'Launcher: %s\n' "$desktop_file"
+if "$set_default"; then
+    printf '%s\n' "Default directory handler: miller-columns.desktop"
+else
+    printf '%s\n' "The default directory handler was not changed."
+fi
