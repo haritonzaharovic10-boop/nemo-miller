@@ -1,182 +1,162 @@
-# Nemo Miller Columns
+# Miller Columns
 
-A Nemo extension (Linux Mint/Cinnamon file manager) that provides a **Miller Columns** view, similar to macOS Finder.
+A keyboard-friendly GTK 3 file manager built around the Miller columns layout.
+It runs as a standalone application and can optionally become the current
+user's default directory handler on Linux desktops.
 
-[Miller Columns](https://en.wikipedia.org/wiki/Miller_columns)
+This project began as a fork of
+[linux-nemo-miller-columns](https://github.com/davemin/linux-nemo-miller-columns).
 
 *[Leggi in Italiano](README_IT.md)*
 
 ## Features
 
-- **Miller Columns View**: Navigate folders in side-by-side columns
-- **Resizable Columns**: Drag separators to adjust column widths
-- **Equal Distribution**: Columns automatically share available space equally (e.g., 4 columns = 25% each)
-- **File Search**: Search by file name AND file content recursively in subdirectories
-- **Preview Panel**: Shows file information and image previews
-- **Nemo Integration**: Right-click menu option "Open in Miller Columns"
-- **Quick Navigation**: Clickable path bar, home and back buttons
-- **Image Preview**: Displays thumbnails for image files
-- **Open in Terminal**: Button to open a terminal in the current folder
-- **Keyboard Shortcuts**: Ctrl+F for search, Backspace to go back, Esc to close
+- Stable, resizable Miller columns with directory look-ahead.
+- Native Up/Down navigation and explicit Left/Right column navigation.
+- Separate active item and marked-item states for multi-file operations.
+- Space toggles marks; Shift extends a range; Ctrl+A marks a whole column.
+- Copy, cut, paste, rename, new-folder and Trash operations.
+- GNOME/Nemo file clipboard interoperability.
+- Multi-file drag and drop both into and out of the application.
+- Text and image previews in the next column, with bounded file reads.
+- Metadata inspector, recursive search, breadcrumbs and terminal/Nemo actions.
+- No permanent-delete command and no silent destination overwrite.
 
 ## Requirements
 
-- Linux Mint 22 (or other distribution with Nemo)
-- Nemo 6.x
-- Python 3
-- GTK 3
-- nemo-python (for the extension)
+- Python 3.10 or newer.
+- GTK 3 and PyGObject (`python3-gi` on Debian-family distributions).
+- GTK/GdkPixbuf/Gio introspection data.
+- `xdg-utils` only when using `install.sh --default`.
+- Nemo and `nemo-python` are optional and needed only for the legacy context
+  menu extension.
 
-## Installation
+Dependencies are deliberately not installed automatically. Use your Linux
+distribution's package manager when one is missing.
 
-### Automatic (recommended)
+## Run from source
 
 ```bash
-cd /path/to/nemo-miller-columns
+python3 nemo_miller_columns.py
+python3 nemo_miller_columns.py /path/to/directory
+```
+
+Running without a path opens the current user's home directory.
+
+## User installation
+
+Install the standalone application and menu launcher without changing the
+default file manager:
+
+```bash
 ./install.sh
 ```
 
-The script will automatically install missing dependencies.
-
-### Manual
-
-1. **Install dependencies**:
+To explicitly make Miller Columns the current user's default handler for
+directories:
 
 ```bash
-sudo apt update
-sudo apt install python3 python3-gi gir1.2-gtk-3.0 nemo-python
+./install.sh --default
 ```
 
-2. **Create directories**:
+The installer:
+
+- never uses `sudo`;
+- never installs files into `/usr`;
+- never installs or restarts the Nemo extension;
+- records the previous directory handler before changing it;
+- installs only below `${XDG_DATA_HOME:-~/.local/share}`.
+
+Uninstall with:
 
 ```bash
-mkdir -p ~/.local/share/nemo-miller-columns
-mkdir -p ~/.local/share/nemo-python/extensions
-```
-
-3. **Copy files**:
-
-```bash
-# Main application
-cp nemo_miller_columns.py ~/.local/share/nemo-miller-columns/
-chmod +x ~/.local/share/nemo-miller-columns/nemo_miller_columns.py
-
-# Nemo extension
-cp nemo-miller-columns-extension.py ~/.local/share/nemo-python/extensions/
-```
-
-4. **Restart Nemo**:
-
-```bash
-nemo -q
-```
-
-## Usage
-
-### From Nemo (context menu)
-
-1. Open Nemo and navigate to a folder
-2. Right-click on a folder **or** on the empty background
-3. Select **"Open in Miller Columns"**
-
-### From terminal
-
-```bash
-python3 ~/.local/share/nemo-miller-columns/nemo_miller_columns.py [path]
-```
-
-Examples:
-```bash
-# Open home directory
-python3 ~/.local/share/nemo-miller-columns/nemo_miller_columns.py
-
-# Open a specific folder
-python3 ~/.local/share/nemo-miller-columns/nemo_miller_columns.py /home/user/Documents
-```
-
-## Keyboard Shortcuts
-
-| Key | Action |
-|-----|--------|
-| `Ctrl+F` | Focus search bar |
-| `Esc` | Exit search mode / Close application |
-| `Backspace` | Go to parent folder |
-| `Enter` / Double-click on file | Open with default application |
-| `Enter` / Click on folder | Navigate into folder |
-
-## Search
-
-The search bar allows you to find files by name or content:
-
-- **Live search**: Results appear as you type (with 300ms debounce)
-- **Recursive**: Searches all subdirectories from current location
-- **Content search**: Also searches inside text files (skips files > 10MB)
-- **Match indicator**: Shows "in content" badge for content matches
-- Click on a result to navigate to it and open the file
-
-## Column Resizing
-
-- **Automatic distribution**: Columns automatically share space equally
-- **Manual resize**: Drag the vertical separators between columns to adjust widths
-- **Minimum width**: Each column has a minimum width of 100px
-- **Visual feedback**: Cursor changes to resize cursor when hovering over separators
-
-## Project Structure
-
-```
-nemo-miller-columns/
-├── nemo_miller_columns.py           # Main GTK application
-├── nemo-miller-columns-extension.py # Nemo context menu extension
-├── install.sh                       # Installation script
-├── uninstall.sh                     # Uninstallation script
-├── README.md                        # English documentation
-└── README_IT.md                     # Italian documentation
-```
-
-## Uninstallation
-
-```bash
-cd /path/to/nemo-miller-columns
 ./uninstall.sh
 ```
 
-## Troubleshooting
+If `--default` recorded a previous directory handler, the uninstaller restores
+it. Stock Nemo is never removed or modified.
 
-### The option doesn't appear in the context menu
+## Keyboard and mouse controls
 
-1. Make sure `nemo-python` is installed:
-   ```bash
-   sudo apt install nemo-python
-   ```
+| Input | Action |
+|---|---|
+| `Up` / `Down` | Move the active item within the focused column |
+| `Left` | Move to the previous Miller column |
+| `Right` / `Enter` | Enter an active directory, or open an active file |
+| `Backspace` | Navigate to the filesystem parent |
+| `Space` | Toggle the active item's marked state |
+| `Shift+Up/Down` | Extend marked range |
+| `Ctrl+A` | Mark every item in the focused column |
+| `Ctrl+C` / `Ctrl+X` / `Ctrl+V` | Copy, cut and paste |
+| `F2` | Rename one active/marked item |
+| `Delete` | Move active/marked items to Trash |
+| `Ctrl+Shift+N` | Create a folder in the active destination |
+| `Ctrl+F` | Focus search |
+| `Esc` | Exit search, clear marks, then close |
+| Click | Make an item active; a file becomes the sole mark |
+| `Ctrl+Click` | Toggle a mark |
+| `Shift+Click` | Mark a range |
+| Double-click | Enter a directory or open a file |
 
-2. Verify the extension is in the correct folder:
-   ```bash
-   ls ~/.local/share/nemo-python/extensions/
-   ```
+The active item drives preview and Miller navigation. Marked items are only
+operation targets, so marking several directories never creates competing
+child columns.
 
-3. Restart Nemo completely:
-   ```bash
-   nemo -q
-   nemo &
-   ```
+## File-operation behavior
 
-4. If it still doesn't work, try restarting your system.
+- A marked set is used first; otherwise the active item is the implicit target.
+- Paste/new-folder targets the active directory, or the focused column's
+  directory when the active item is a file or absent.
+- Directories copy recursively and symlinks are preserved where practical.
+- Existing destinations are rejected rather than overwritten.
+- Copying/moving a directory into itself or its descendants is rejected.
+- `Delete` uses Gio Trash and never falls back to permanent deletion.
+- Partial cut failures retain failed paths in the clipboard.
 
-### "Nemo module not found" error
+## Known limitations
 
-The `gi.repository.Nemo` module is only available inside Nemo. The extension will work correctly when loaded by Nemo itself.
+- Undo/redo is not implemented yet.
+- There is no general filesystem monitor; built-in operations refresh affected
+  visible columns, but external changes may need navigation to become visible.
+- Recursive copy/move and some preview work can still block the GTK main thread.
+- Clipboard and drag/drop accept local `file://` paths only.
+- Search cancellation and stale-result delivery need further hardening.
+- Desktop environments that call a file manager through a private D-Bus API
+  may bypass the standard `inode/directory` association.
 
-### The application doesn't start
+## Development
 
-Verify that GTK 3 is installed correctly:
+Run the display-free test suite:
+
 ```bash
-python3 -c "import gi; gi.require_version('Gtk', '3.0'); from gi.repository import Gtk; print('OK')"
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
 ```
+
+Validate syntax without writing bytecode into the repository:
+
+```bash
+PYTHONPYCACHEPREFIX=/tmp/miller-columns-pycache \
+python3 -m py_compile nemo_miller_columns.py \
+  nemo-miller-columns-extension.py tests/*.py
+```
+
+Filesystem tests use dedicated temporary directories under `/tmp`. Do not test
+mutating operations on personal data.
+
+## Repository layout
+
+```text
+assets/                            Preview fallback artwork
+nemo_miller_columns.py             Standalone GTK application
+nemo-miller-columns-extension.py   Optional legacy Nemo context-menu source
+tests/                              Standard-library tests
+install.sh                          Safe per-user standalone installer
+uninstall.sh                        Per-user uninstaller
+```
+
+The fallback preview artwork was generated specifically for this project and
+is distributed under the repository's MIT license.
 
 ## License
 
-MIT License - You are free to use, modify, and distribute this software.
-
-## Contributing
-
-Contributions, bug reports, and feature requests are welcome!
+[MIT](LICENSE). The original copyright notice is preserved.

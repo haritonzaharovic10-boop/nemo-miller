@@ -7,6 +7,11 @@ Adds a context menu entry "Open in Miller Columns"
 import os
 import subprocess
 from urllib.parse import unquote
+
+import gi
+
+gi.require_version('Nemo', '3.0')
+
 from gi.repository import Nemo, GObject
 
 
@@ -15,8 +20,12 @@ class MillerColumnsExtension(GObject.GObject, Nemo.MenuProvider):
 
     def __init__(self):
         super().__init__()
-        # Path to the Miller Columns application
-        self.app_path = os.path.expanduser("~/.local/share/nemo-miller-columns/nemo_miller_columns.py")
+        data_home = os.environ.get(
+            "XDG_DATA_HOME", os.path.expanduser("~/.local/share")
+        )
+        self.app_path = os.path.join(
+            data_home, "miller-columns", "nemo_miller_columns.py"
+        )
 
     def _open_miller_columns(self, menu, folder_path):
         """Opens the folder in Miller Columns"""

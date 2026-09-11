@@ -9,19 +9,312 @@ import os
 import gi
 import subprocess
 import mimetypes
+import shutil
 import urllib.parse
 import threading
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Generator, Optional
 
-from navigation_state import NavigationError, NavigationState, SelectionEventGate
-
 gi.require_version('Gtk', '3.0')
 gi.require_version('GdkPixbuf', '2.0')
 gi.require_version('Pango', '1.0')
 
 from gi.repository import Gtk, Gdk, GdkPixbuf, Gio, GLib, Pango
+
+
+CLIPBOARD_COPY = "copy"
+CLIPBOARD_CUT = "cut"
+RESIZE_HANDLE_WIDTH = 6
+MAX_PREVIEW_BYTES = 256 * 1024
+MAX_PREVIEW_LINES = 200
+UNSUPPORTED_PREVIEW_IMAGE = (
+    Path(__file__).resolve().parent /
+    "assets" / "unsupported-preview-original.png"
+)
+GNOME_COPIED_FILES_NAME = "x-special/gnome-copied-files"
+URI_LIST_NAME = "text/uri-list"
+GNOME_COPIED_FILES_INFO = 1
+URI_LIST_INFO = 2
+
+
+class FileOperationError(Exception):
+    """A user-facing file operation failure."""
+
+
+def path_exists(path):
+    path = Path(path)
+    return path.exists() or path.is_symlink()
+
+
+def resolve_operation_paths(marked_paths, active_path):
+    """Use ordered marked paths, otherwise one active path if available."""
+    marked = tuple(Path(path) for path in marked_paths)
+    if marked:
+        return marked
+    if active_path is None:
+        return ()
+    return (Path(active_path),)
+
+
+def resolve_drag_paths(ordered_marked_paths, pressed_path):
+    """Drag the complete marked set only when the gesture starts on it."""
+    marked = tuple(Path(path) for path in ordered_marked_paths)
+    if pressed_path is None:
+        return ()
+    pressed_path = Path(pressed_path)
+    if pressed_path in marked:
+        return marked
+    return (pressed_path,)
+
+
+def serialize_gnome_file_clipboard(mode, paths):
+    """Serialize paths using the GNOME/Nemo copied-files convention."""
+    if mode not in (CLIPBOARD_COPY, CLIPBOARD_CUT):
+        raise ValueError(f"Unsupported clipboard mode: {mode}")
+    lines = [mode]
+    lines.extend(Path(path).resolve().as_uri() for path in paths)
+    # Nemo splits every line after mode into a URI, including a trailing empty
+    # line. Never append a final newline: it would become an invalid "" path.
+    return "\n".join(lines).encode("utf-8")
+
+
+def parse_file_uri_list(text):
+    """Parse local file URIs from clipboard text in visible order."""
+    paths = []
+    for raw_line in text.replace("\r\n", "\n").split("\n"):
+        uri = raw_line.strip()
+        if not uri or uri.startswith("#"):
+            continue
+        parsed = urllib.parse.urlsplit(uri)
+        if parsed.scheme != "file" or parsed.netloc not in ("", "localhost"):
+            raise FileOperationError(f"Unsupported clipboard URI: {uri}")
+        paths.append(Path(urllib.parse.unquote(parsed.path)))
+    return tuple(paths)
+
+
+def parse_gnome_file_clipboard(data):
+    """Return mode and ordered local paths from GNOME copied-files data."""
+    if isinstance(data, bytes):
+        text = data.rstrip(b"\x00").decode("utf-8", errors="strict")
+    else:
+        text = str(data)
+    lines = text.replace("\r\n", "\n").split("\n")
+    if not lines or lines[0].strip() not in (CLIPBOARD_COPY, CLIPBOARD_CUT):
+        raise FileOperationError("Clipboard does not contain a valid file operation")
+    mode = lines[0].strip()
+    paths = parse_file_uri_list("\n".join(lines[1:]))
+    if not paths:
+        raise FileOperationError("Clipboard file list is empty")
+    return mode, paths
+
+
+def resolve_operation_destination(column_path, active_path, active_is_directory):
+    """Use an active directory as destination, otherwise the column path."""
+    if active_path is not None and active_is_directory:
+        return Path(active_path)
+    return Path(column_path)
+
+
+def calculate_auto_column_width(total_width, column_widths, slot_count):
+    """Calculate stable auto width while reserving virtual child slots."""
+    slot_count = max(slot_count, len(column_widths), 1)
+    virtual_handle_width = RESIZE_HANDLE_WIDTH * (slot_count - 1)
+    available_width = max(1, total_width - virtual_handle_width)
+    fixed_width = sum(width for width in column_widths if width != -1)
+    empty_slot_count = slot_count - len(column_widths)
+    auto_slot_count = (
+        sum(1 for width in column_widths if width == -1) +
+        empty_slot_count
+    )
+    if auto_slot_count == 0:
+        return 0
+    return max(1, (available_width - fixed_width) // auto_slot_count)
+
+
+def calculate_width_slot_count(column_count, reserved_child_column_index):
+    """Keep one child slot for the working column without retaining old depth."""
+    if column_count <= 0:
+        return 1
+    working_index = min(
+        max(reserved_child_column_index, 0), column_count - 1
+    )
+    return max(column_count, working_index + 2)
+
+
+def validate_name(name):
+    """Validate one basename used by rename/new-folder operations."""
+    if not name or name in ('.', '..') or '/' in name:
+        raise FileOperationError(
+            "Name must be non-empty, not '.' or '..', and contain no '/'"
+        )
+    return name
+
+
+def _require_source(source):
+    source = Path(source)
+    if not path_exists(source):
+        raise FileOperationError(f"Source does not exist: {source}")
+    return source
+
+
+def _require_destination_directory(destination_directory):
+    destination_directory = Path(destination_directory)
+    if not destination_directory.is_dir():
+        raise FileOperationError(
+            f"Destination is not a directory: {destination_directory}"
+        )
+    return destination_directory
+
+
+def _available_destination(source, destination_directory):
+    destination = destination_directory / source.name
+    if path_exists(destination):
+        raise FileOperationError(f"Destination already exists: {destination}")
+    return destination
+
+
+def _reject_recursive_destination(source, destination):
+    if source.is_symlink() or not source.is_dir():
+        return
+    try:
+        source_resolved = source.resolve(strict=True)
+        destination_resolved = destination.resolve(strict=False)
+    except (OSError, RuntimeError) as error:
+        raise FileOperationError(f"Cannot validate destination: {error}") from error
+    if (destination_resolved == source_resolved or
+            source_resolved in destination_resolved.parents):
+        raise FileOperationError(
+            f"Cannot copy or move a directory into itself: {source}"
+        )
+
+
+def copy_path(source, destination_directory):
+    """Copy one path without overwriting and return its destination."""
+    source = _require_source(source)
+    destination_directory = _require_destination_directory(destination_directory)
+    destination = _available_destination(source, destination_directory)
+    _reject_recursive_destination(source, destination)
+
+    try:
+        if source.is_symlink():
+            os.symlink(os.readlink(source), destination)
+        elif source.is_dir():
+            shutil.copytree(source, destination, symlinks=True)
+        else:
+            shutil.copy2(source, destination, follow_symlinks=False)
+    except (OSError, shutil.Error) as error:
+        raise FileOperationError(str(error)) from error
+    return destination
+
+
+def move_path(source, destination_directory):
+    """Move one path without overwriting and return its destination."""
+    source = _require_source(source)
+    destination_directory = _require_destination_directory(destination_directory)
+    destination = _available_destination(source, destination_directory)
+    _reject_recursive_destination(source, destination)
+
+    try:
+        shutil.move(str(source), str(destination))
+    except (OSError, shutil.Error) as error:
+        raise FileOperationError(str(error)) from error
+    return destination
+
+
+def rename_path(source, new_name):
+    """Rename one path within its parent without overwriting."""
+    source = _require_source(source)
+    validate_name(new_name)
+    destination = source.parent / new_name
+    if destination == source:
+        return source
+    if path_exists(destination):
+        raise FileOperationError(f"Destination already exists: {destination}")
+    try:
+        source.rename(destination)
+    except OSError as error:
+        raise FileOperationError(str(error)) from error
+    return destination
+
+
+def create_folder(destination_directory, name):
+    """Create one folder without overwriting and return its path."""
+    destination_directory = _require_destination_directory(destination_directory)
+    validate_name(name)
+    destination = destination_directory / name
+    if path_exists(destination):
+        raise FileOperationError(f"Destination already exists: {destination}")
+    try:
+        destination.mkdir()
+    except OSError as error:
+        raise FileOperationError(str(error)) from error
+    return destination
+
+
+def trash_path(path):
+    """Move one path to the desktop trash; never permanently delete it."""
+    path = _require_source(path)
+    try:
+        trashed = Gio.File.new_for_path(str(path)).trash(None)
+    except Exception as error:
+        raise FileOperationError(str(error)) from error
+    if not trashed:
+        raise FileOperationError(f"Trash operation was not supported for: {path}")
+
+
+@dataclass(frozen=True)
+class FilePreviewData:
+    kind: str
+    text: str = ""
+    truncated: bool = False
+    message: str = ""
+
+
+def load_file_preview(path):
+    """Load bounded plain text metadata or classify an image/unsupported file."""
+    path = Path(path)
+    mime_type, _encoding = mimetypes.guess_type(str(path))
+    if mime_type and mime_type.startswith("image/"):
+        return FilePreviewData(kind="image")
+
+    text_mime = (
+        mime_type is None or
+        mime_type.startswith("text/") or
+        mime_type in {
+            "application/json",
+            "application/xml",
+            "application/javascript",
+            "application/x-python",
+            "application/x-sh",
+            "application/x-perl",
+        }
+    )
+    if not text_mime:
+        return FilePreviewData(
+            kind="unsupported", message=mime_type or "Unsupported file"
+        )
+
+    try:
+        with open(path, "rb") as file_handle:
+            content = file_handle.read(MAX_PREVIEW_BYTES + 1)
+    except OSError as error:
+        return FilePreviewData(kind="unsupported", message=str(error))
+
+    if b"\x00" in content:
+        return FilePreviewData(kind="unsupported", message="Binary file")
+
+    byte_truncated = len(content) > MAX_PREVIEW_BYTES
+    content = content[:MAX_PREVIEW_BYTES]
+    text = content.decode("utf-8", errors="replace")
+    lines = text.splitlines()
+    line_truncated = len(lines) > MAX_PREVIEW_LINES
+    visible_text = "\n".join(lines[:MAX_PREVIEW_LINES])
+    return FilePreviewData(
+        kind="text",
+        text=visible_text,
+        truncated=byte_truncated or line_truncated,
+    )
 
 
 class FileItem:
@@ -68,15 +361,26 @@ class ColumnView(Gtk.Box):
 
     MIN_WIDTH = 100
 
-    def __init__(self, path, on_item_selected, on_item_activated):
+    def __init__(self, path, on_item_selected, on_item_activated,
+                 on_files_dropped, on_drag_finished):
         super().__init__(orientation=Gtk.Orientation.VERTICAL)
         self.path = Path(path)
         self.on_item_selected = on_item_selected
         self.on_item_activated = on_item_activated
+        self.on_files_dropped = on_files_dropped
+        self.on_drag_finished = on_drag_finished
         self.icon_theme = Gtk.IconTheme.get_default()
-        self.selection_event_gate = SelectionEventGate()
+        self.active_item_path = None
+        self.marked_paths = set()
+        self.mark_anchor_path = None
+        self._extend_marks_on_next_selection = False
+        self._suppress_navigation_callback = False
+        self._pressed_path = None
+        self._pending_plain_click_path = None
+        self._drag_paths = ()
 
         # Set minimum width
+        self.set_hexpand(False)
         self.set_size_request(self.MIN_WIDTH, -1)
 
         # ScrolledWindow for the list
@@ -87,9 +391,29 @@ class ColumnView(Gtk.Box):
 
         # ListBox for items
         self.listbox = Gtk.ListBox()
+        self.listbox.set_can_focus(True)
         self.listbox.set_selection_mode(Gtk.SelectionMode.SINGLE)
+        self.listbox.set_activate_on_single_click(False)
         self.listbox.connect("row-selected", self._on_row_selected)
         self.listbox.connect("row-activated", self._on_row_activated)
+        self.listbox.connect("button-press-event", self._on_button_press)
+        self.listbox.connect("button-release-event", self._on_button_release)
+        self.listbox.drag_source_set(
+            Gdk.ModifierType.BUTTON1_MASK,
+            [],
+            Gdk.DragAction.COPY | Gdk.DragAction.MOVE,
+        )
+        self.listbox.drag_source_add_uri_targets()
+        self.listbox.connect("drag-begin", self._on_drag_begin)
+        self.listbox.connect("drag-data-get", self._on_drag_data_get)
+        self.listbox.connect("drag-end", self._on_drag_end)
+        self.listbox.drag_dest_set(
+            Gtk.DestDefaults.ALL,
+            [],
+            Gdk.DragAction.COPY | Gdk.DragAction.MOVE,
+        )
+        self.listbox.drag_dest_add_uri_targets()
+        self.listbox.connect("drag-data-received", self._on_drag_data_received)
         self.listbox.get_style_context().add_class("miller-column")
 
         scroll.add(self.listbox)
@@ -167,44 +491,452 @@ class ColumnView(Gtk.Box):
         return row
 
     def _on_row_selected(self, listbox, row):
-        """Forwards user selection or deselection to navigation state."""
-        if not self.selection_event_gate.user_notifications_enabled:
-            return
-        if row is None:
-            self.on_item_selected(self, None)
-        elif hasattr(row, 'item'):
-            self.on_item_selected(self, row.item)
+        """Handles row selection"""
+        if row and hasattr(row, 'item'):
+            self.active_item_path = row.item.path
+            if self._extend_marks_on_next_selection:
+                self._mark_range_to(row.item.path)
+            if not self._suppress_navigation_callback:
+                self.on_item_selected(self, row.item)
+        elif row is None:
+            self.active_item_path = None
 
     def _on_row_activated(self, listbox, row):
         """Handles row activation (double-click)"""
         if row and hasattr(row, 'item'):
             self.on_item_activated(row.item)
 
-    def find_item(self, path):
-        """Returns the currently rendered item for a path, if present."""
-        if path is None:
-            return None
-        target = Path(path)
+    def select_path(self, path, notify_navigation=True):
+        """Select a path, optionally as visual-only path reconstruction."""
+        path = Path(path)
         for row in self.listbox.get_children():
-            if hasattr(row, 'item') and row.item.path == target:
-                return row.item
+            if hasattr(row, 'item') and row.item.path == path:
+                old_suppression = self._suppress_navigation_callback
+                if not notify_navigation:
+                    self._suppress_navigation_callback = True
+                try:
+                    self.listbox.select_row(row)
+                finally:
+                    self._suppress_navigation_callback = old_suppression
+                return True
+        return False
+
+    def get_active_item(self):
+        """Returns the single row that drives navigation and preview."""
+        row = self.listbox.get_selected_row()
+        if row is not None and hasattr(row, 'item'):
+            return row.item
         return None
 
-    def restore_cursor(self, path):
-        """Restore visual selection without emitting a user navigation event."""
-        target = Path(path) if path is not None else None
-        selected_row = None
+    def grab_navigation_focus(self, select_first=False):
+        """Focus ACTIVE, optionally establishing the first row as ACTIVE."""
+        row = self.listbox.get_selected_row()
+        if row is None and select_first:
+            row = self.listbox.get_row_at_index(0)
+            if row is not None:
+                # This changes ACTIVE only; MARKED paths remain independent.
+                self.listbox.select_row(row)
+        if row is not None:
+            row.grab_focus()
+        else:
+            self.listbox.grab_focus()
+
+    def get_operation_destination(self):
+        """Resolve paste/new-folder destination from this column's ACTIVE."""
+        active_item = self.get_active_item()
+        return resolve_operation_destination(
+            self.path,
+            active_item.path if active_item is not None else None,
+            active_item.is_dir if active_item is not None else False,
+        )
+
+    def _on_button_press(self, listbox, event):
+        """Updates marks for a mouse gesture while GTK controls the active row."""
+        self._pressed_path = None
+        self._pending_plain_click_path = None
+        if event.button != 1 or event.type != Gdk.EventType.BUTTON_PRESS:
+            return False
+        if event.state & (
+                Gdk.ModifierType.MOD1_MASK |
+                Gdk.ModifierType.MOD4_MASK |
+                Gdk.ModifierType.SUPER_MASK):
+            return False
+
+        row = self.listbox.get_row_at_y(int(event.y))
+        if row is None or not hasattr(row, 'item'):
+            return False
+
+        path = row.item.path
+        self._pressed_path = path
+        if event.state & Gdk.ModifierType.SHIFT_MASK:
+            if self.mark_anchor_path is None:
+                self.mark_anchor_path = self.active_item_path or path
+            self._mark_range_to(path)
+        elif event.state & Gdk.ModifierType.CONTROL_MASK:
+            self._toggle_mark(path)
+        else:
+            if path in self.marked_paths:
+                # Keep the full marked set long enough for GTK's drag
+                # threshold to be crossed. A click without a drag collapses
+                # it normally in _on_button_release().
+                self._pending_plain_click_path = path
+            else:
+                self._apply_plain_click_marks(row.item)
+
+        # SINGLE mode may natively deselect a Ctrl-clicked active row. Restore
+        # that clicked row after GTK processes the event so it remains active.
+        if event.state & (
+                Gdk.ModifierType.CONTROL_MASK |
+                Gdk.ModifierType.SHIFT_MASK):
+            GLib.idle_add(self._ensure_mouse_active, row)
+        return False
+
+    def _on_button_release(self, listbox, event):
+        """Complete a plain click only if it did not become a drag."""
+        if event.button != 1:
+            return False
+        pending_path = self._pending_plain_click_path
+        self._pending_plain_click_path = None
+        self._pressed_path = None
+        if pending_path is None:
+            return False
+        row = self._row_for_path(pending_path)
+        if row is not None:
+            self._apply_plain_click_marks(row.item)
+        return False
+
+    def _apply_plain_click_marks(self, item):
+        """Apply the existing plain-click operation-selection semantics."""
+        self.marked_paths = set() if item.is_dir else {item.path}
+        self.mark_anchor_path = item.path
+        self._refresh_mark_styles()
+
+    def _row_for_path(self, path):
+        path = Path(path)
         for row in self.listbox.get_children():
-            if hasattr(row, 'item') and row.item.path == target:
-                selected_row = row
-                break
+            if hasattr(row, 'item') and row.item.path == path:
+                return row
+        return None
 
-        # Gtk.ListBox.select_row() emits row-selected synchronously. Restrict
-        # suppression to this one view-level reconciliation operation.
-        with self.selection_event_gate.programmatic_change():
-            self.listbox.select_row(selected_row)
+    def _on_drag_begin(self, listbox, context):
+        """Snapshot drag targets before mouse release can alter marks."""
+        self._drag_paths = resolve_drag_paths(
+            (item.path for item in self.get_marked_items()),
+            self._pressed_path,
+        )
+        self._pending_plain_click_path = None
+        if self._drag_paths:
+            Gtk.drag_set_icon_name(context, "text-x-generic", 0, 0)
 
-        return target is None or selected_row is not None
+    def _on_drag_data_get(self, listbox, context, selection_data, info, time_):
+        """Publish every dragged local path using the standard URI target."""
+        if self._drag_paths:
+            selection_data.set_uris([
+                path.resolve().as_uri() for path in self._drag_paths
+            ])
+
+    def _on_drag_end(self, listbox, context):
+        drag_paths = self._drag_paths
+        action = context.get_selected_action()
+        self._pressed_path = None
+        self._pending_plain_click_path = None
+        self._drag_paths = ()
+        if drag_paths and action & Gdk.DragAction.MOVE:
+            self.on_drag_finished(drag_paths)
+
+    def _on_drag_data_received(self, listbox, context, x, y,
+                               selection_data, info, time_):
+        """Resolve the drop row and delegate filesystem semantics upward."""
+        row = self.listbox.get_row_at_y(int(y))
+        item = row.item if row is not None and hasattr(row, 'item') else None
+        destination_directory = resolve_operation_destination(
+            self.path,
+            item.path if item is not None else None,
+            item.is_dir if item is not None else False,
+        )
+        self.on_files_dropped(
+            selection_data.get_uris() or (),
+            destination_directory,
+            context.get_selected_action(),
+            context,
+            time_,
+        )
+
+    def _ensure_mouse_active(self, row):
+        """Keeps a modifier-clicked row active without opening it."""
+        if row.get_parent() is self.listbox:
+            self.listbox.select_row(row)
+        return False
+
+    def _ordered_item_paths(self):
+        return [
+            row.item.path for row in self.listbox.get_children()
+            if hasattr(row, 'item')
+        ]
+
+    def _toggle_mark(self, path):
+        if path in self.marked_paths:
+            self.marked_paths.remove(path)
+        else:
+            self.marked_paths.add(path)
+        if self.mark_anchor_path is None:
+            self.mark_anchor_path = path
+        self._refresh_mark_styles()
+
+    def _mark_range_to(self, path):
+        ordered_paths = self._ordered_item_paths()
+        try:
+            anchor_index = ordered_paths.index(self.mark_anchor_path)
+            path_index = ordered_paths.index(path)
+        except ValueError:
+            self.mark_anchor_path = path
+            self.marked_paths = {path}
+        else:
+            start, end = sorted((anchor_index, path_index))
+            self.marked_paths = set(ordered_paths[start:end + 1])
+        self._refresh_mark_styles()
+
+    def _refresh_mark_styles(self):
+        for row in self.listbox.get_children():
+            if not hasattr(row, 'item'):
+                continue
+            style = row.get_style_context()
+            if row.item.path in self.marked_paths:
+                style.add_class("marked-item")
+            else:
+                style.remove_class("marked-item")
+
+    def prepare_keyboard_range_extension(self):
+        """Lets native Shift+Up/Down move active, then marks its range."""
+        if self.mark_anchor_path is None:
+            self.mark_anchor_path = self.active_item_path
+        self._extend_marks_on_next_selection = True
+        GLib.idle_add(self._finish_keyboard_range_extension)
+
+    def _finish_keyboard_range_extension(self):
+        self._extend_marks_on_next_selection = False
+        return False
+
+    def toggle_active_mark(self):
+        """Toggles the active item without changing active selection."""
+        if self.active_item_path is None:
+            return False
+        self._toggle_mark(self.active_item_path)
+        return True
+
+    def mark_all(self):
+        """Marks every selectable item without navigation side effects."""
+        self.marked_paths = set(self._ordered_item_paths())
+        self._refresh_mark_styles()
+
+    def clear_marks(self):
+        """Clears operation marks and anchor without changing active item."""
+        had_marks = bool(self.marked_paths)
+        self.marked_paths.clear()
+        self.mark_anchor_path = None
+        self._extend_marks_on_next_selection = False
+        self._refresh_mark_styles()
+        return had_marks
+
+    def get_marked_items(self):
+        """Returns marked items in visible row order for file operations."""
+        return [
+            row.item for row in self.listbox.get_children()
+            if hasattr(row, 'item') and row.item.path in self.marked_paths
+        ]
+
+    def get_operation_paths(self):
+        """Returns marked paths, or the active path as an implicit target."""
+        return resolve_operation_paths(
+            (item.path for item in self.get_marked_items()),
+            self.active_item_path,
+        )
+
+    def refresh(self, replacements=None):
+        """Repopulate while preserving surviving active/marked paths."""
+        replacements = {
+            Path(source): Path(destination)
+            for source, destination in (replacements or {}).items()
+        }
+        active_path = replacements.get(
+            self.active_item_path, self.active_item_path
+        )
+        marked_paths = {
+            replacements.get(path, path) for path in self.marked_paths
+        }
+        anchor_path = replacements.get(
+            self.mark_anchor_path, self.mark_anchor_path
+        )
+
+        self._extend_marks_on_next_selection = False
+        self._suppress_navigation_callback = True
+        try:
+            self.populate()
+            visible_paths = set(self._ordered_item_paths())
+            self.marked_paths = marked_paths & visible_paths
+            self.mark_anchor_path = (
+                anchor_path if anchor_path in visible_paths else None
+            )
+            self.active_item_path = None
+            if active_path in visible_paths:
+                self.select_path(active_path)
+            else:
+                self.listbox.unselect_all()
+        finally:
+            self._suppress_navigation_callback = False
+
+        self._refresh_mark_styles()
+
+    def contains_focus(self, focused_widget):
+        """Returns whether GTK focus is within this column's listbox."""
+        while focused_widget is not None:
+            if focused_widget is self.listbox:
+                return True
+            focused_widget = focused_widget.get_parent()
+        return False
+
+
+class FilePreviewColumn(Gtk.Box):
+    """Non-interactive text/image preview occupying the reserved child slot."""
+
+    def __init__(self, path):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        self.path = Path(path)
+        self._destroyed = False
+        self._pixbuf = None
+        self.preview_kind = "loading"
+        self.set_hexpand(False)
+        self.set_size_request(1, -1)
+        self.get_style_context().add_class("file-preview-column")
+        self.connect("destroy", self._on_destroy)
+
+        title = Gtk.Label(label=self.path.name)
+        title.set_xalign(0)
+        title.set_ellipsize(Pango.EllipsizeMode.MIDDLE)
+        title.set_margin_start(8)
+        title.set_margin_end(8)
+        title.set_margin_top(6)
+        self.pack_start(title, False, False, 0)
+
+        self.content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        loading = Gtk.Label(label="Loading preview…")
+        loading.get_style_context().add_class("dim-label")
+        self.content.pack_start(loading, True, True, 12)
+        self.pack_start(self.content, True, True, 0)
+        self.show_all()
+
+        threading.Thread(
+            target=self._load_preview,
+            daemon=True,
+        ).start()
+
+    def _on_destroy(self, widget):
+        self._destroyed = True
+
+    def _load_preview(self):
+        data = load_file_preview(self.path)
+        pixbuf = None
+        if data.kind == "image":
+            try:
+                pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_scale(
+                    str(self.path), 1024, 1024, True
+                )
+            except Exception as error:
+                data = FilePreviewData(
+                    kind="unsupported", message=f"Image error: {error}"
+                )
+
+        if data.kind == "unsupported" and UNSUPPORTED_PREVIEW_IMAGE.exists():
+            try:
+                pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_scale(
+                    str(UNSUPPORTED_PREVIEW_IMAGE), 512, 512, True
+                )
+            except Exception:
+                pixbuf = None
+
+        GLib.idle_add(self._apply_preview, data, pixbuf)
+
+    def _apply_preview(self, data, pixbuf):
+        if self._destroyed:
+            return False
+        self.preview_kind = data.kind
+        for child in self.content.get_children():
+            self.content.remove(child)
+
+        if data.kind == "text":
+            self._show_text(data)
+        else:
+            self._show_image_or_fallback(data, pixbuf)
+        self.content.show_all()
+        return False
+
+    def _show_text(self, data):
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        scroll.set_vexpand(True)
+
+        text_view = Gtk.TextView()
+        text_view.set_editable(False)
+        text_view.set_cursor_visible(False)
+        text_view.set_monospace(True)
+        text_view.set_wrap_mode(Gtk.WrapMode.NONE)
+        text_view.set_left_margin(8)
+        text_view.set_right_margin(8)
+        text_view.set_top_margin(8)
+        text_view.set_bottom_margin(8)
+        text_view.get_buffer().set_text(data.text)
+        scroll.add(text_view)
+        self.content.pack_start(scroll, True, True, 0)
+
+        if data.truncated:
+            status = Gtk.Label(label="Preview truncated")
+            status.get_style_context().add_class("dim-label")
+            self.content.pack_start(status, False, False, 6)
+
+    def _show_image_or_fallback(self, data, pixbuf):
+        self._pixbuf = pixbuf
+        if pixbuf is not None:
+            drawing = Gtk.DrawingArea()
+            drawing.set_size_request(1, 1)
+            drawing.set_vexpand(True)
+            drawing.connect("draw", self._draw_pixbuf)
+            self.content.pack_start(drawing, True, True, 0)
+        else:
+            icon = Gtk.Image.new_from_icon_name(
+                "dialog-question-symbolic", Gtk.IconSize.DIALOG
+            )
+            self.content.pack_start(icon, True, True, 12)
+
+        if data.kind == "unsupported":
+            message = Gtk.Label(label=data.message or "Preview unavailable")
+            message.set_ellipsize(Pango.EllipsizeMode.END)
+            message.set_max_width_chars(1)
+            message.set_tooltip_text(data.message or "Preview unavailable")
+            message.set_margin_start(8)
+            message.set_margin_end(8)
+            message.set_margin_bottom(8)
+            message.get_style_context().add_class("dim-label")
+            self.content.pack_start(message, False, False, 0)
+
+    def _draw_pixbuf(self, widget, context):
+        if self._pixbuf is None:
+            return False
+        allocation = widget.get_allocation()
+        pixbuf_width = self._pixbuf.get_width()
+        pixbuf_height = self._pixbuf.get_height()
+        scale = min(
+            allocation.width / pixbuf_width,
+            allocation.height / pixbuf_height,
+        )
+        x = (allocation.width - pixbuf_width * scale) / 2
+        y = (allocation.height - pixbuf_height * scale) / 2
+        context.save()
+        context.translate(x, y)
+        context.scale(scale, scale)
+        Gdk.cairo_set_source_pixbuf(context, self._pixbuf, 0, 0)
+        context.paint()
+        context.restore()
+        return False
 
 
 class ResizeHandle(Gtk.EventBox):
@@ -272,7 +1004,7 @@ class ResizeHandle(Gtk.EventBox):
 
 
 class PreviewPanel(Gtk.Box):
-    """Preview panel for the selected file"""
+    """Metadata inspector for the active file or directory."""
 
     def __init__(self):
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=12)
@@ -306,15 +1038,7 @@ class PreviewPanel(Gtk.Box):
         self.info_grid.set_row_spacing(6)
         self.pack_start(self.info_grid, False, False, 0)
 
-        # Image preview
-        self.preview_scroll = Gtk.ScrolledWindow()
-        self.preview_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
-        self.preview_image = Gtk.Image()
-        self.preview_scroll.add(self.preview_image)
-        self.pack_start(self.preview_scroll, True, True, 0)
-
         self.show_all()
-        self.preview_scroll.hide()
 
     def update(self, item):
         """Updates the preview with item information"""
@@ -369,8 +1093,6 @@ class PreviewPanel(Gtk.Box):
         # Path
         self._add_info_row("Path:", str(item.path.parent), row)
 
-        # Image preview
-        self._update_image_preview(item)
         self.info_grid.show_all()
 
     def _add_info_row(self, label_text, value_text, row):
@@ -396,32 +1118,12 @@ class PreviewPanel(Gtk.Box):
             size /= 1024
         return f"{size:.1f} PB"
 
-    def _update_image_preview(self, item):
-        """Shows preview if item is an image"""
-        if item.is_dir:
-            self.preview_scroll.hide()
-            return
-
-        mime_type, _ = mimetypes.guess_type(str(item.path))
-        if mime_type and mime_type.startswith('image/'):
-            try:
-                pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_scale(
-                    str(item.path), 250, 250, True
-                )
-                self.preview_image.set_from_pixbuf(pixbuf)
-                self.preview_scroll.show()
-            except Exception:
-                self.preview_scroll.hide()
-        else:
-            self.preview_scroll.hide()
-
     def clear(self):
-        """Clears the preview panel"""
+        """Clears the metadata inspector."""
         self.icon_image.clear()
         self.name_label.set_text("")
         for child in self.info_grid.get_children():
             self.info_grid.remove(child)
-        self.preview_scroll.hide()
 
 
 @dataclass
@@ -675,20 +1377,35 @@ class SearchResultsView(Gtk.Box):
 class MillerColumnsContainer(Gtk.Box):
     """Container for Miller columns with resizing support"""
 
-    def __init__(self, on_item_selected, on_item_activated):
+    def __init__(self, on_item_selected, on_item_activated,
+                 on_files_dropped, on_drag_finished):
         super().__init__(orientation=Gtk.Orientation.HORIZONTAL)
         self.on_item_selected_callback = on_item_selected
         self.on_item_activated_callback = on_item_activated
+        self.on_files_dropped_callback = on_files_dropped
+        self.on_drag_finished_callback = on_drag_finished
 
         self.columns = []  # List of ColumnView
         self.handles = []  # List of ResizeHandle
         self.column_widths = []  # Column widths (-1 = auto)
+        self.reserved_child_column_index = 0
+        self.width_slot_count = 1
+        self.file_preview = None
+        self.file_preview_separator = None
+        self.file_preview_source = None
 
         self.get_style_context().add_class("miller-columns-container")
 
-    def _add_column(self, path):
-        """Adds one low-level view column during state reconciliation."""
-        column = ColumnView(path, self._on_item_selected, self.on_item_activated_callback)
+    def add_column(self, path):
+        """Adds a new column"""
+        self.clear_file_preview()
+        column = ColumnView(
+            path,
+            self._on_item_selected,
+            self.on_item_activated_callback,
+            self.on_files_dropped_callback,
+            self.on_drag_finished_callback,
+        )
 
         # If there are existing columns, add a resize handle
         if self.columns:
@@ -701,7 +1418,9 @@ class MillerColumnsContainer(Gtk.Box):
         self.columns.append(column)
         self.column_widths.append(-1)  # -1 means "auto"
 
-        self.pack_start(column, True, True, 0)
+        # Width distribution reserves an empty child slot. Do not let GtkBox
+        # expand real columns into that reserved space.
+        self.pack_start(column, False, True, 0)
         column.show_all()
 
         # Recalculate widths
@@ -709,9 +1428,17 @@ class MillerColumnsContainer(Gtk.Box):
 
         return column
 
-    def _truncate_columns(self, count):
-        """Removes view columns from the right until ``count`` remain."""
-        while len(self.columns) > count:
+    def remove_columns_after(self, column):
+        """Removes all columns after the specified one"""
+        if column not in self.columns:
+            return
+
+        self.clear_file_preview()
+
+        idx = self.columns.index(column)
+
+        # Remove columns and handles
+        while len(self.columns) > idx + 1:
             col = self.columns.pop()
             self.remove(col)
             col.destroy()
@@ -722,50 +1449,70 @@ class MillerColumnsContainer(Gtk.Box):
                 self.remove(handle)
                 handle.destroy()
 
-    def reconcile(self, navigation_state):
-        """Render columns and cursors from canonical NavigationState."""
-        target_paths = navigation_state.visible_directories
-        common_count = 0
-        for column, path in zip(self.columns, target_paths):
-            if column.path != path:
-                break
-            common_count += 1
-
-        self._truncate_columns(common_count)
-        for path in target_paths[common_count:]:
-            self._add_column(path)
-
-        for column, cursor in zip(self.columns, navigation_state.cursor_paths):
-            column.restore_cursor(cursor)
-
-        self._assert_structure()
+        # Recalculate widths
         GLib.idle_add(self._distribute_widths)
-
-    def get_current_item(self, navigation_state):
-        """Resolve the canonical current cursor back to its rendered FileItem."""
-        path = navigation_state.current_item
-        if path is None:
-            return None
-        index = navigation_state.active_column_index
-        if not 0 <= index < len(self.columns):
-            return None
-        return self.columns[index].find_item(path)
 
     def clear(self):
         """Removes all columns"""
-        self._truncate_columns(0)
-        self._assert_structure()
+        self.clear_file_preview()
+        for col in self.columns:
+            self.remove(col)
+            col.destroy()
+        for handle in self.handles:
+            self.remove(handle)
+            handle.destroy()
+        self.columns.clear()
+        self.handles.clear()
+        self.column_widths.clear()
+        self.reserved_child_column_index = 0
+        self.width_slot_count = 1
 
-    def _assert_structure(self):
-        """Checks the parallel widget/width/handle representation."""
-        assert len(self.column_widths) == len(self.columns)
-        assert len(self.handles) == max(0, len(self.columns) - 1)
-        for index, handle in enumerate(self.handles):
-            assert handle.column_index == index
+    def show_file_preview(self, column, path):
+        """Fill the reserved child slot with a non-navigation file preview."""
+        if column not in self.columns:
+            return
+        self.clear_file_preview()
+
+        separator = Gtk.Separator(orientation=Gtk.Orientation.VERTICAL)
+        separator.set_size_request(RESIZE_HANDLE_WIDTH, -1)
+        separator.get_style_context().add_class("resize-handle")
+        preview = FilePreviewColumn(path)
+
+        self.file_preview_source = column
+        self.file_preview_separator = separator
+        self.file_preview = preview
+        self.pack_start(separator, False, False, 0)
+        self.pack_start(preview, False, True, 0)
+        separator.show_all()
+        preview.show_all()
+        GLib.idle_add(self._distribute_widths)
+
+    def clear_file_preview(self):
+        """Remove the transient preview slot without changing directories."""
+        if self.file_preview is not None:
+            self.remove(self.file_preview)
+            self.file_preview.destroy()
+        if self.file_preview_separator is not None:
+            self.remove(self.file_preview_separator)
+            self.file_preview_separator.destroy()
+        self.file_preview = None
+        self.file_preview_separator = None
+        self.file_preview_source = None
 
     def _on_item_selected(self, column, item):
         """Handles selection and recalculates widths"""
+        self.reserve_child_slot(column)
         self.on_item_selected_callback(column, item)
+        GLib.idle_add(self._distribute_widths)
+
+    def reserve_child_slot(self, column):
+        """Reserve stable width for one potential child of ``column``."""
+        if column not in self.columns:
+            return
+        self.reserved_child_column_index = self.columns.index(column)
+        self.width_slot_count = calculate_width_slot_count(
+            len(self.columns), self.reserved_child_column_index
+        )
         GLib.idle_add(self._distribute_widths)
 
     def _distribute_widths(self):
@@ -779,18 +1526,14 @@ class MillerColumnsContainer(Gtk.Box):
         if total_width <= 1:
             return False
 
-        # Calculate space for handles
-        handle_width = 6 * len(self.handles)
-        available_width = total_width - handle_width
-
-        # Count columns with auto width
-        auto_count = sum(1 for w in self.column_widths if w == -1)
-        fixed_width = sum(w for w in self.column_widths if w != -1)
-
-        if auto_count > 0:
-            auto_width = max(ColumnView.MIN_WIDTH, (available_width - fixed_width) // auto_count)
-        else:
-            auto_width = 0
+        self.width_slot_count = calculate_width_slot_count(
+            len(self.columns), self.reserved_child_column_index
+        )
+        auto_width = calculate_auto_column_width(
+            total_width,
+            self.column_widths,
+            self.width_slot_count,
+        )
 
         # Apply widths
         for i, col in enumerate(self.columns):
@@ -798,6 +1541,9 @@ class MillerColumnsContainer(Gtk.Box):
                 col.set_size_request(auto_width, -1)
             else:
                 col.set_size_request(self.column_widths[i], -1)
+
+        if self.file_preview is not None:
+            self.file_preview.set_size_request(auto_width, -1)
 
         return False
 
@@ -846,18 +1592,49 @@ class MillerColumnsWindow(Gtk.ApplicationWindow):
         super().__init__(application=app, title="Nemo Miller Columns")
 
         self.set_default_size(1200, 700)
-        requested_path = Path(start_path or Path.home())
-        try:
-            self.navigation_state = NavigationState(requested_path)
-        except NavigationError as error:
-            print(f"Cannot navigate to {requested_path}: {error}")
-            self.navigation_state = NavigationState(Path.home())
+        self.current_path = Path(start_path or Path.home())
 
         # Search state
         self.search_mode = False
         self.search_engine = SearchEngine()
         self.search_thread = None
         self.search_timeout_id = None
+
+        # Application-owned file clipboard with GNOME/Nemo interoperability.
+        self.clipboard_mode = None
+        self.clipboard_paths = ()
+        self.clipboard_selection = Gdk.SELECTION_CLIPBOARD
+        self.gnome_copied_files_target = Gdk.Atom.intern(
+            GNOME_COPIED_FILES_NAME, False
+        )
+        self.uri_list_target = Gdk.Atom.intern(URI_LIST_NAME, False)
+        self.clipboard_owner = Gtk.Invisible()
+        self.clipboard_owner.connect(
+            "selection-get", self._on_clipboard_selection_get
+        )
+        self.clipboard_owner.connect(
+            "selection-clear-event", self._on_clipboard_selection_clear
+        )
+        Gtk.selection_add_target(
+            self.clipboard_owner,
+            self.clipboard_selection,
+            self.gnome_copied_files_target,
+            GNOME_COPIED_FILES_INFO,
+        )
+        Gtk.selection_add_target(
+            self.clipboard_owner,
+            self.clipboard_selection,
+            self.uri_list_target,
+            URI_LIST_INFO,
+        )
+
+        # GTK may undo focus changes made during key-press CAPTURE. Hold one
+        # replaceable target until key release, with one idle fallback for
+        # keyboard/driver paths where that release is not delivered here.
+        self.pending_focus_column = None
+        self.pending_focus_keyval = None
+        self.pending_focus_source_id = None
+        self.pending_focus_select_first = False
 
         self._setup_css()
 
@@ -880,7 +1657,9 @@ class MillerColumnsWindow(Gtk.ApplicationWindow):
         # Columns container
         self.columns_container = MillerColumnsContainer(
             self._on_item_selected,
-            self._on_item_activated
+            self._on_item_activated,
+            self._on_files_dropped,
+            self._on_drag_finished,
         )
         columns_frame = Gtk.Frame()
         columns_frame.add(self.columns_container)
@@ -903,16 +1682,21 @@ class MillerColumnsWindow(Gtk.ApplicationWindow):
 
         self.main_paned.set_position(900)
 
-        # Render the validated initial navigation state.
-        self._reconcile_navigation()
+        # Navigate to initial path
+        self._navigate_to(self.current_path)
 
         self.connect("key-press-event", self._on_key_press)
+        self.miller_key_controller = Gtk.EventControllerKey.new(self)
+        self.miller_key_controller.set_propagation_phase(
+            Gtk.PropagationPhase.CAPTURE
+        )
+        self.miller_key_controller.connect(
+            "key-pressed", self._on_miller_navigation_key_pressed
+        )
+        self.miller_key_controller.connect(
+            "key-released", self._on_miller_navigation_key_released
+        )
         self.show_all()
-
-    @property
-    def current_path(self):
-        """Compatibility view of the canonical current directory."""
-        return self.navigation_state.current_directory
 
     def _setup_css(self):
         """Sets up custom CSS styles"""
@@ -925,13 +1709,30 @@ class MillerColumnsWindow(Gtk.ApplicationWindow):
             background-color: @theme_base_color;
         }
 
+        .file-preview-column {
+            background-color: @theme_base_color;
+            border-left: 1px solid @borders;
+        }
+
         .miller-column row {
             padding: 2px;
         }
 
         .miller-column row:selected {
+            background-color: alpha(@theme_selected_bg_color, 0.20);
+            color: @theme_fg_color;
+            box-shadow: inset 0 0 0 1px @theme_selected_bg_color;
+        }
+
+        .miller-column row.marked-item {
             background-color: @theme_selected_bg_color;
             color: @theme_selected_fg_color;
+        }
+
+        .miller-column row.marked-item:selected {
+            background-color: @theme_selected_bg_color;
+            color: @theme_selected_fg_color;
+            box-shadow: inset 0 0 0 2px @theme_selected_fg_color;
         }
 
         .preview-frame {
@@ -1057,58 +1858,78 @@ class MillerColumnsWindow(Gtk.ApplicationWindow):
 
     def _navigate_to(self, path):
         """Navigates to a specific path"""
-        if not self.navigation_state.navigate_to(path):
-            print(self.navigation_state.last_error)
+        try:
+            path = Path(path).resolve()
+        except (OSError, RuntimeError):
             return False
 
-        self._reconcile_navigation()
-        return True
+        if not path.is_dir():
+            return False
 
-    def _reconcile_navigation(self):
-        """Render navigation widgets and preview from canonical state."""
-        self.columns_container.reconcile(self.navigation_state)
-        self._update_path_bar()
-        self.preview_panel.update(
-            self.columns_container.get_current_item(self.navigation_state)
-        )
+        self.columns_container.clear()
+        self.preview_panel.clear()
 
-    def _on_item_selected(self, column, item):
-        """Handles user item selection or explicit deselection."""
-        try:
-            column_index = self.columns_container.columns.index(column)
-        except ValueError:
-            return
+        parts = path.parts
+        current = Path(parts[0])
 
-        if item is None:
-            transition_succeeded = self.navigation_state.clear_cursor(column_index)
-        else:
-            transition_succeeded = self.navigation_state.select_item(
-                column_index, item.path, item.is_dir
+        self.columns_container.add_column(current)
+
+        for part in parts[1:]:
+            next_path = current / part
+            if next_path.is_dir():
+                if self.columns_container.columns:
+                    # This selection only renders the ancestry cursor. Its
+                    # normal callback would add the child here, and the next
+                    # line would then add the same semantic column again.
+                    self.columns_container.columns[-1].select_path(
+                        next_path, notify_navigation=False
+                    )
+                self.columns_container.add_column(next_path)
+                current = next_path
+
+        if self.columns_container.columns:
+            self.columns_container.reserve_child_slot(
+                self.columns_container.columns[-1]
             )
 
-        if not transition_succeeded:
-            print(self.navigation_state.last_error)
+        self.current_path = path
+        self._update_path_bar()
+        return True
 
-        # On failure this restores widget selection from unchanged state; on
-        # success it renders the new path chain. Restoration is notification-
-        # suppressed by each ColumnView and cannot recurse into this method.
-        self._reconcile_navigation()
+    def _on_item_selected(self, column, item):
+        """Handles item selection"""
+        self.columns_container.remove_columns_after(column)
+
+        if item.is_dir:
+            self.columns_container.add_column(item.path)
+            self.current_path = item.path
+        else:
+            self.current_path = item.path.parent
+            self.columns_container.show_file_preview(column, item.path)
+
+        self._update_path_bar()
+        self.preview_panel.update(item)
 
     def _on_item_activated(self, item):
         """Handles item activation (double-click)"""
-        if not item.is_dir:
-            try:
-                subprocess.Popen(['xdg-open', str(item.path)])
-            except Exception as e:
-                dialog = Gtk.MessageDialog(
-                    transient_for=self,
-                    flags=0,
-                    message_type=Gtk.MessageType.ERROR,
-                    buttons=Gtk.ButtonsType.OK,
-                    text=f"Cannot open file: {e}"
-                )
-                dialog.run()
-                dialog.destroy()
+        if item.is_dir:
+            focused_column = self._get_focused_column()
+            if focused_column is not None:
+                self._enter_active_item(focused_column)
+            return
+
+        try:
+            subprocess.Popen(['xdg-open', str(item.path)])
+        except Exception as e:
+            dialog = Gtk.MessageDialog(
+                transient_for=self,
+                flags=0,
+                message_type=Gtk.MessageType.ERROR,
+                buttons=Gtk.ButtonsType.OK,
+                text=f"Cannot open file: {e}"
+            )
+            dialog.run()
+            dialog.destroy()
 
     def _on_go_back(self, button):
         """Goes to parent directory"""
@@ -1232,16 +2053,59 @@ class MillerColumnsWindow(Gtk.ApplicationWindow):
 
     def _on_key_press(self, widget, event):
         """Handles keyboard shortcuts"""
-        # Ctrl+F: Focus search entry
+        focused_column = self._get_focused_column()
+        shortcut_keyval = self._shortcut_keyval(
+            event.keyval, event.hardware_keycode
+        )
+
+        # Ctrl+A: mark all items in the focused Miller column.
         if event.state & Gdk.ModifierType.CONTROL_MASK:
-            if event.keyval == Gdk.KEY_f:
+            if (shortcut_keyval == Gdk.KEY_a and
+                    not event.state & (
+                        Gdk.ModifierType.SHIFT_MASK |
+                        Gdk.ModifierType.MOD1_MASK |
+                        Gdk.ModifierType.MOD4_MASK |
+                        Gdk.ModifierType.SUPER_MASK
+                    ) and focused_column is not None):
+                focused_column.mark_all()
+                return True
+
+            # Ctrl+F: Focus search entry
+            if shortcut_keyval == Gdk.KEY_f:
                 self.search_entry.grab_focus()
                 return True
+
+        # Space toggles only the active item's operation mark.
+        if (event.keyval == Gdk.KEY_space and
+                not event.state & (
+                    Gdk.ModifierType.SHIFT_MASK |
+                    Gdk.ModifierType.CONTROL_MASK |
+                    Gdk.ModifierType.MOD1_MASK |
+                    Gdk.ModifierType.MOD4_MASK |
+                    Gdk.ModifierType.SUPER_MASK
+                ) and focused_column is not None):
+            focused_column.toggle_active_mark()
+            return True
+
+        # Native Gtk.ListBox still moves the active row. This flag only makes
+        # Shift+Up/Down extend operation marks when that selection callback runs.
+        if (event.state & Gdk.ModifierType.SHIFT_MASK and
+                not event.state & (
+                    Gdk.ModifierType.CONTROL_MASK |
+                    Gdk.ModifierType.MOD1_MASK |
+                    Gdk.ModifierType.MOD4_MASK |
+                    Gdk.ModifierType.SUPER_MASK
+                ) and event.keyval in (Gdk.KEY_Up, Gdk.KEY_Down) and
+                focused_column is not None):
+            focused_column.prepare_keyboard_range_extension()
+            return False
 
         # Escape: Exit search mode or close window
         if event.keyval == Gdk.KEY_Escape:
             if self.search_mode:
                 self._exit_search_mode()
+                return True
+            elif self._clear_all_marks():
                 return True
             else:
                 self.close()
@@ -1255,6 +2119,523 @@ class MillerColumnsWindow(Gtk.ApplicationWindow):
                 return True
 
         return False
+
+    def _get_focused_column(self):
+        """Returns the Miller column containing the current GTK focus."""
+        focused_widget = self.get_focus()
+        if isinstance(focused_widget, Gtk.Editable):
+            return None
+        for column in self.columns_container.columns:
+            if column.contains_focus(focused_widget):
+                return column
+        return None
+
+    def _on_miller_navigation_key_pressed(self, controller, keyval,
+                                          keycode, state):
+        """Captures file hotkeys and Miller keys in a focused column."""
+        column = self.pending_focus_column or self._get_focused_column()
+        if column is None:
+            return False
+
+        if state & (
+                Gdk.ModifierType.MOD1_MASK |
+                Gdk.ModifierType.MOD4_MASK |
+                Gdk.ModifierType.SUPER_MASK):
+            return False
+
+        control = bool(state & Gdk.ModifierType.CONTROL_MASK)
+        shift = bool(state & Gdk.ModifierType.SHIFT_MASK)
+        lower_keyval = self._shortcut_keyval(keyval, keycode)
+
+        if control and not shift:
+            if lower_keyval == Gdk.KEY_c:
+                self._stage_clipboard(CLIPBOARD_COPY, column)
+                return True
+            if lower_keyval == Gdk.KEY_x:
+                self._stage_clipboard(CLIPBOARD_CUT, column)
+                return True
+            if lower_keyval == Gdk.KEY_v:
+                self._paste_clipboard(column)
+                return True
+
+        if control and shift and lower_keyval == Gdk.KEY_n:
+            self._create_new_folder(column)
+            return True
+
+        if not control and not shift:
+            if keyval == Gdk.KEY_F2:
+                self._rename_operation_target(column)
+                return True
+            if keyval == Gdk.KEY_Delete:
+                self._trash_operation_targets(column)
+                return True
+            if keyval == Gdk.KEY_Left:
+                self._focus_previous_column(column, keyval)
+                return True
+            if keyval in (Gdk.KEY_Right, Gdk.KEY_Return, Gdk.KEY_KP_Enter):
+                self._enter_active_item(column, keyval)
+                return True
+        return False
+
+    def _shortcut_keyval(self, keyval, hardware_keycode):
+        """Resolve letter shortcuts from physical keys, independent of layout."""
+        keymap = Gdk.Keymap.get_for_display(self.get_display())
+        translated, base_keyval, _group, _level, _consumed = (
+            keymap.translate_keyboard_state(
+                hardware_keycode, Gdk.ModifierType(0), 0
+            )
+        )
+        if translated:
+            return Gdk.keyval_to_lower(base_keyval)
+        return Gdk.keyval_to_lower(keyval)
+
+    def _on_miller_navigation_key_released(self, controller, keyval,
+                                           keycode, state):
+        """Apply a captured column transition before the next key press."""
+        if keyval != self.pending_focus_keyval:
+            return
+        self._apply_pending_column_focus()
+
+    def _clear_all_marks(self):
+        """Clears marks in every live column without changing navigation."""
+        had_marks = False
+        for column in self.columns_container.columns:
+            had_marks = column.clear_marks() or had_marks
+        return had_marks
+
+    def _stage_clipboard(self, mode, column):
+        """Snapshot focused-column targets without changing their marks."""
+        paths = column.get_operation_paths()
+        if paths:
+            self._publish_file_clipboard(mode, paths)
+
+    def _publish_file_clipboard(self, mode, paths):
+        """Own the X11 clipboard and advertise GNOME/Nemo file targets."""
+        paths = tuple(Path(path) for path in paths)
+        owned = Gtk.selection_owner_set(
+            self.clipboard_owner,
+            self.clipboard_selection,
+            Gdk.CURRENT_TIME,
+        )
+        self.clipboard_mode = mode
+        self.clipboard_paths = paths
+        if not owned:
+            self._show_error(
+                "Clipboard unavailable",
+                "Could not publish files to the desktop clipboard."
+            )
+
+    def _on_clipboard_selection_get(self, widget, selection_data, info, time_):
+        """Provide advertised file data when another application requests it."""
+        if not self.clipboard_paths or self.clipboard_mode is None:
+            return
+        if info == GNOME_COPIED_FILES_INFO:
+            payload = serialize_gnome_file_clipboard(
+                self.clipboard_mode, self.clipboard_paths
+            )
+            selection_data.set(
+                self.gnome_copied_files_target, 8, payload
+            )
+        elif info == URI_LIST_INFO:
+            selection_data.set_uris([
+                path.resolve().as_uri() for path in self.clipboard_paths
+            ])
+
+    def _on_clipboard_selection_clear(self, widget, event):
+        """Drop stale internal state when another owner replaces clipboard."""
+        self.clipboard_mode = None
+        self.clipboard_paths = ()
+        return False
+
+    def _paste_clipboard(self, column):
+        """Request external file targets, falling back to in-app state."""
+        destination_directory = column.get_operation_destination()
+        clipboard = Gtk.Clipboard.get(self.clipboard_selection)
+        clipboard.request_targets(
+            self._on_clipboard_targets_received,
+            destination_directory,
+        )
+
+    def _on_clipboard_targets_received(self, clipboard, targets, n_targets,
+                                       destination_directory):
+        """Choose the richest supported external file clipboard format."""
+        targets = tuple((targets or ())[:n_targets])
+        if self.gnome_copied_files_target in targets:
+            clipboard.request_contents(
+                self.gnome_copied_files_target,
+                self._on_clipboard_contents_received,
+                (destination_directory, GNOME_COPIED_FILES_INFO),
+            )
+            return
+        if self.uri_list_target in targets:
+            clipboard.request_contents(
+                self.uri_list_target,
+                self._on_clipboard_contents_received,
+                (destination_directory, URI_LIST_INFO),
+            )
+            return
+        if (self.clipboard_mode in (CLIPBOARD_COPY, CLIPBOARD_CUT) and
+                self.clipboard_paths):
+            self._execute_paste(
+                self.clipboard_mode,
+                self.clipboard_paths,
+                destination_directory,
+            )
+
+    def _on_clipboard_contents_received(self, clipboard, selection_data,
+                                        context):
+        """Parse external file targets and execute the existing paste path."""
+        destination_directory, target_info = context
+        try:
+            if target_info == GNOME_COPIED_FILES_INFO:
+                mode, paths = parse_gnome_file_clipboard(
+                    selection_data.get_data()
+                )
+            else:
+                uris = selection_data.get_uris() or ()
+                mode = CLIPBOARD_COPY
+                paths = parse_file_uri_list("\n".join(uris))
+                if not paths:
+                    raise FileOperationError("Clipboard file list is empty")
+        except (FileOperationError, UnicodeError) as error:
+            self._show_error("Paste failed", str(error))
+            return
+        self._execute_paste(mode, paths, destination_directory)
+
+    def _execute_paste(self, mode, clipboard_paths, destination_directory,
+                       update_cut_clipboard=True, failure_title="Paste failed"):
+        """Copy or move parsed clipboard paths into a resolved destination."""
+        clipboard_paths = tuple(Path(path) for path in clipboard_paths)
+        destination_directory = Path(destination_directory)
+        failures = []
+        succeeded = []
+        affected_directories = {destination_directory}
+        operation = copy_path if mode == CLIPBOARD_COPY else move_path
+
+        for source in clipboard_paths:
+            if mode == CLIPBOARD_CUT:
+                affected_directories.add(source.parent)
+            try:
+                operation(source, destination_directory)
+            except FileOperationError as error:
+                failures.append((source, str(error)))
+            else:
+                succeeded.append(source)
+
+        # Refresh even after failure because a recursive/cross-filesystem
+        # operation may have created a partial destination before reporting it.
+        self._refresh_after_mutation(affected_directories)
+
+        if mode == CLIPBOARD_CUT and update_cut_clipboard:
+            failed_paths = {path for path, _message in failures}
+            remaining_paths = tuple(
+                path for path in clipboard_paths if path in failed_paths
+            )
+            if remaining_paths:
+                self._publish_file_clipboard(CLIPBOARD_CUT, remaining_paths)
+            else:
+                self.clipboard_mode = None
+                self.clipboard_paths = ()
+                Gtk.selection_owner_set(
+                    None,
+                    self.clipboard_selection,
+                    Gdk.CURRENT_TIME,
+                )
+
+        self._show_operation_failures(failure_title, failures)
+        return tuple(succeeded), tuple(failures)
+
+    def _on_files_dropped(self, uris, destination_directory, action,
+                          drag_context, time_):
+        """Execute one external/internal URI drop through safe file ops."""
+        try:
+            paths = parse_file_uri_list("\n".join(uris))
+            if not paths:
+                raise FileOperationError("Dropped file list is empty")
+        except (FileOperationError, UnicodeError) as error:
+            Gtk.drag_finish(drag_context, False, False, time_)
+            self._show_error("Drop failed", str(error))
+            return
+
+        mode = (
+            CLIPBOARD_CUT
+            if action & Gdk.DragAction.MOVE
+            else CLIPBOARD_COPY
+        )
+        succeeded, _failures = self._execute_paste(
+            mode,
+            paths,
+            destination_directory,
+            update_cut_clipboard=False,
+            failure_title="Drop failed",
+        )
+        # The receiver has already performed MOVE itself, so the source must
+        # never delete files in response to drag completion.
+        Gtk.drag_finish(drag_context, bool(succeeded), False, time_)
+
+    def _on_drag_finished(self, paths):
+        """Refresh sources after another application accepted a MOVE drag."""
+        self._refresh_after_mutation({Path(path).parent for path in paths})
+
+    def _rename_operation_target(self, column):
+        """Prompt for and rename exactly one focused-column target."""
+        targets = column.get_operation_paths()
+        if not targets:
+            return
+        if len(targets) != 1:
+            self._show_error(
+                "Rename unavailable",
+                "Select or mark exactly one item to rename."
+            )
+            return
+
+        source = targets[0]
+        new_name = self._prompt_for_name("Rename", source.name)
+        if new_name is None:
+            return
+        try:
+            destination = rename_path(source, new_name)
+        except FileOperationError as error:
+            self._show_operation_failures(
+                "Rename failed", [(source, str(error))]
+            )
+            return
+
+        self.clipboard_paths = tuple(
+            destination if path == source else path
+            for path in self.clipboard_paths
+        )
+        self._refresh_after_mutation(
+            {source.parent}, replacements={source: destination}
+        )
+
+    def _trash_operation_targets(self, column):
+        """Move focused-column targets to Trash without delete fallback."""
+        targets = column.get_operation_paths()
+        if not targets:
+            return
+
+        failures = []
+        succeeded = []
+        affected_directories = set()
+        for target in targets:
+            try:
+                trash_path(target)
+            except FileOperationError as error:
+                failures.append((target, str(error)))
+            else:
+                succeeded.append(target)
+                affected_directories.add(target.parent)
+
+        if succeeded:
+            succeeded_set = set(succeeded)
+            self.clipboard_paths = tuple(
+                path for path in self.clipboard_paths
+                if path not in succeeded_set
+            )
+            if not self.clipboard_paths:
+                self.clipboard_mode = None
+            self._refresh_after_mutation(affected_directories)
+
+        self._show_operation_failures("Move to Trash failed", failures)
+
+    def _create_new_folder(self, column):
+        """Prompt for and create a folder in the operation destination."""
+        destination_directory = column.get_operation_destination()
+        name = self._prompt_for_name("New Folder", "New Folder")
+        if name is None:
+            return
+        try:
+            create_folder(destination_directory, name)
+        except FileOperationError as error:
+            self._show_operation_failures(
+                "Create folder failed", [(destination_directory, str(error))]
+            )
+            return
+        self._refresh_after_mutation({destination_directory})
+
+    def _prompt_for_name(self, title, initial_name):
+        """Show a small modal basename prompt and return text or None."""
+        dialog = Gtk.Dialog(
+            title=title,
+            transient_for=self,
+            flags=Gtk.DialogFlags.MODAL,
+        )
+        dialog.add_buttons(
+            Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL,
+            Gtk.STOCK_OK, Gtk.ResponseType.OK,
+        )
+        dialog.set_default_response(Gtk.ResponseType.OK)
+
+        entry = Gtk.Entry()
+        entry.set_text(initial_name)
+        entry.select_region(0, -1)
+        entry.set_activates_default(True)
+        entry.set_margin_start(12)
+        entry.set_margin_end(12)
+        entry.set_margin_top(12)
+        entry.set_margin_bottom(12)
+        dialog.get_content_area().pack_start(entry, False, False, 0)
+        dialog.show_all()
+
+        response = dialog.run()
+        name = entry.get_text() if response == Gtk.ResponseType.OK else None
+        dialog.destroy()
+        return name
+
+    def _show_operation_failures(self, title, failures):
+        """Show at most one concise error dialog for a batch operation."""
+        if not failures:
+            return
+        lines = [f"{path.name or path}: {message}" for path, message in failures[:8]]
+        if len(failures) > 8:
+            lines.append(f"...and {len(failures) - 8} more")
+        self._show_error(title, "\n".join(lines))
+
+    def _show_error(self, title, detail):
+        dialog = Gtk.MessageDialog(
+            transient_for=self,
+            flags=0,
+            message_type=Gtk.MessageType.ERROR,
+            buttons=Gtk.ButtonsType.OK,
+            text=title,
+        )
+        dialog.format_secondary_text(detail)
+        dialog.run()
+        dialog.destroy()
+
+    def _refresh_after_mutation(self, directory_paths, replacements=None):
+        """Refresh affected live columns and prune missing child branches."""
+        directory_paths = {Path(path) for path in directory_paths}
+        replacements = replacements or {}
+        focused_column = self._get_focused_column()
+
+        index = 0
+        while index < len(self.columns_container.columns):
+            column = self.columns_container.columns[index]
+            if not column.path.is_dir():
+                if index > 0:
+                    self.columns_container.remove_columns_after(
+                        self.columns_container.columns[index - 1]
+                    )
+                break
+            if column.path in directory_paths:
+                column.refresh(replacements)
+            index += 1
+
+        if self.columns_container.columns:
+            self.current_path = self.columns_container.columns[-1].path
+            self._update_path_bar()
+
+        if focused_column in self.columns_container.columns:
+            active_item = focused_column.get_active_item()
+            self.preview_panel.update(active_item)
+            if active_item is not None and not active_item.is_dir:
+                self.columns_container.show_file_preview(
+                    focused_column, active_item.path
+                )
+            focused_column.grab_navigation_focus()
+        else:
+            self.preview_panel.clear()
+
+    def _focus_previous_column(self, column, keyval):
+        """Moves focus left without changing selections or navigation state."""
+        try:
+            index = self.columns_container.columns.index(column)
+        except ValueError:
+            return
+        if index > 0:
+            # Keep the source column as the parent's immediate child, but drop
+            # its own child/lookahead branch before moving focus left.
+            self.columns_container.remove_columns_after(column)
+            target = self.columns_container.columns[index - 1]
+            self._request_column_focus(target, keyval, select_first=False)
+
+    def _request_column_focus(self, column, keyval, select_first):
+        """Replace the one focus target awaiting its matching key release."""
+        if self.pending_focus_source_id is not None:
+            GLib.source_remove(self.pending_focus_source_id)
+        self.pending_focus_column = column
+        self.pending_focus_keyval = keyval
+        self.pending_focus_select_first = select_first
+        self.pending_focus_source_id = GLib.idle_add(
+            self._apply_pending_column_focus,
+            True,
+            priority=GLib.PRIORITY_HIGH,
+        )
+
+    def _apply_pending_column_focus(self, from_idle=False):
+        """Apply and clear the sole pending focus transition."""
+        source_id = self.pending_focus_source_id
+        if source_id is not None and not from_idle:
+            GLib.source_remove(source_id)
+        column = self.pending_focus_column
+        select_first = self.pending_focus_select_first
+        self.pending_focus_column = None
+        self.pending_focus_keyval = None
+        self.pending_focus_source_id = None
+        self.pending_focus_select_first = False
+        if column in self.columns_container.columns:
+            self.columns_container.reserve_child_slot(column)
+            column.grab_navigation_focus(select_first=select_first)
+            if select_first:
+                self._restore_active_child_column(column)
+            self._synchronize_column_context(column)
+        return False
+
+    def _restore_active_child_column(self, column):
+        """Restore the lookahead for an unchanged ACTIVE directory."""
+        item = column.get_active_item()
+        if item is None or not item.is_dir:
+            return
+        try:
+            index = self.columns_container.columns.index(column)
+        except ValueError:
+            return
+
+        child_index = index + 1
+        if child_index < len(self.columns_container.columns):
+            child = self.columns_container.columns[child_index]
+            if child.path == item.path:
+                return
+        self.columns_container.remove_columns_after(column)
+        self.columns_container.add_column(item.path)
+
+    def _synchronize_column_context(self, column):
+        """Make the focused column immediately drive path and preview context."""
+        if column not in self.columns_container.columns:
+            return
+        self.current_path = column.path
+        self._update_path_bar()
+        self.preview_panel.update(column.get_active_item())
+
+    def _enter_active_item(self, column, keyval=None):
+        """Focuses a directory child or opens a file through existing behavior."""
+        item = column.get_active_item()
+        if item is None:
+            return
+        if not item.is_dir:
+            self._on_item_activated(item)
+            return
+
+        try:
+            index = self.columns_container.columns.index(column)
+        except ValueError:
+            return
+        child_index = index + 1
+        if child_index < len(self.columns_container.columns):
+            child = self.columns_container.columns[child_index]
+            if child.path == item.path:
+                if keyval is None:
+                    self.columns_container.reserve_child_slot(child)
+                    child.grab_navigation_focus(select_first=True)
+                    self._restore_active_child_column(child)
+                    self._synchronize_column_context(child)
+                else:
+                    self._request_column_focus(
+                        child, keyval, select_first=True
+                    )
+                return
 
 
 class MillerColumnsApp(Gtk.Application):
@@ -1282,6 +2663,11 @@ class MillerColumnsApp(Gtk.Application):
             if path.startswith('file://'):
                 path = urllib.parse.unquote(path[7:])
             self.start_path = path
+        else:
+            # Every launcher invocation without a path starts in the user's
+            # home directory, rather than reusing an earlier invocation's
+            # command-line path from this long-lived Gtk.Application.
+            self.start_path = None
 
         self.activate()
         return 0
