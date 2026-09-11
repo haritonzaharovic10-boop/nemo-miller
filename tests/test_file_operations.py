@@ -14,6 +14,7 @@ from nemo_miller_columns import (
     parse_file_uri_list,
     parse_gnome_file_clipboard,
     rename_path,
+    resolve_drag_paths,
     resolve_operation_destination,
     resolve_operation_paths,
     serialize_gnome_file_clipboard,
@@ -59,6 +60,24 @@ class SystemClipboardFormatTests(unittest.TestCase):
     def test_invalid_gnome_clipboard_mode_is_rejected(self):
         with self.assertRaises(FileOperationError):
             parse_gnome_file_clipboard(b"link\nfile:///tmp/one.txt\n")
+
+    def test_drag_from_marked_item_exports_all_marks_in_visible_order(self):
+        marked = (Path("/tmp/first.txt"), Path("/tmp/second.txt"))
+
+        paths = resolve_drag_paths(marked, marked[1])
+
+        self.assertEqual(paths, marked)
+
+    def test_drag_from_unmarked_item_exports_only_pressed_item(self):
+        marked = (Path("/tmp/first.txt"), Path("/tmp/second.txt"))
+        pressed = Path("/tmp/third.txt")
+
+        paths = resolve_drag_paths(marked, pressed)
+
+        self.assertEqual(paths, (pressed,))
+
+    def test_drag_without_pressed_item_exports_nothing(self):
+        self.assertEqual(resolve_drag_paths((Path("/tmp/first.txt"),), None), ())
 
 
 class ColumnWidthTests(unittest.TestCase):

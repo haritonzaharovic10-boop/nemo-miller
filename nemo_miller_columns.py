@@ -56,6 +56,17 @@ def resolve_operation_paths(marked_paths, active_path):
     return (Path(active_path),)
 
 
+def resolve_drag_paths(ordered_marked_paths, pressed_path):
+    """Drag the complete marked set only when the gesture starts on it."""
+    marked = tuple(Path(path) for path in ordered_marked_paths)
+    if pressed_path is None:
+        return ()
+    pressed_path = Path(pressed_path)
+    if pressed_path in marked:
+        return marked
+    return (pressed_path,)
+
+
 def serialize_gnome_file_clipboard(mode, paths):
     """Serialize paths using the GNOME/Nemo copied-files convention."""
     if mode not in (CLIPBOARD_COPY, CLIPBOARD_CUT):
@@ -349,17 +360,23 @@ class ColumnView(Gtk.Box):
 
     MIN_WIDTH = 100
 
-    def __init__(self, path, on_item_selected, on_item_activated):
+    def __init__(self, path, on_item_selected, on_item_activated,
+                 on_files_dropped, on_drag_finished):
         super().__init__(orientation=Gtk.Orientation.VERTICAL)
         self.path = Path(path)
         self.on_item_selected = on_item_selected
         self.on_item_activated = on_item_activated
+        self.on_files_dropped = on_files_dropped
+        self.on_drag_finished = on_drag_finished
         self.icon_theme = Gtk.IconTheme.get_default()
         self.active_item_path = None
         self.marked_paths = set()
         self.mark_anchor_path = None
         self._extend_marks_on_next_selection = False
         self._suppress_navigation_callback = False
+        self._pressed_path = None
+        self._pending_plain_click_path = None
+        self._drag_paths = ()
 
         # Set minimum width
         self.set_hexpand(False)
@@ -379,6 +396,23 @@ class ColumnView(Gtk.Box):
         self.listbox.connect("row-selected", self._on_row_selected)
         self.listbox.connect("row-activated", self._on_row_activated)
         self.listbox.connect("button-press-event", self._on_button_press)
+        self.listbox.connect("button-release-event", self._on_button_release)
+        self.listbox.drag_source_set(
+            Gdk.ModifierType.BUTTON1_MASK,
+            [],
+            Gdk.DragAction.COPY | Gdk.DragAction.MOVE,
+        )
+        self.listbox.drag_source_add_uri_targets()
+        self.listbox.connect("drag-begin", self._on_drag_begin)
+        self.listbox.connect("drag-data-get", self._on_drag_data_get)
+        self.listbox.connect("drag-end", self._on_drag_end)
+        self.listbox.drag_dest_set(
+            Gtk.DestDefaults.ALL,
+            [],
+            Gdk.DragAction.COPY | Gdk.DragAction.MOVE,
+        )
+        self.listbox.drag_dest_add_uri_targets()
+        self.listbox.connect("drag-data-received", self._on_drag_data_received)
         self.listbox.get_style_context().add_class("miller-column")
 
         scroll.add(self.listbox)
@@ -471,12 +505,18 @@ class ColumnView(Gtk.Box):
         if row and hasattr(row, 'item'):
             self.on_item_activated(row.item)
 
-    def select_path(self, path):
-        """Selects an item by its path"""
+    def select_path(self, path, notify_navigation=True):
+        """Select a path, optionally as visual-only path reconstruction."""
         path = Path(path)
         for row in self.listbox.get_children():
             if hasattr(row, 'item') and row.item.path == path:
-                self.listbox.select_row(row)
+                old_suppression = self._suppress_navigation_callback
+                if not notify_navigation:
+                    self._suppress_navigation_callback = True
+                try:
+                    self.listbox.select_row(row)
+                finally:
+                    self._suppress_navigation_callback = old_suppression
                 return True
         return False
 
@@ -511,6 +551,8 @@ class ColumnView(Gtk.Box):
 
     def _on_button_press(self, listbox, event):
         """Updates marks for a mouse gesture while GTK controls the active row."""
+        self._pressed_path = None
+        self._pending_plain_click_path = None
         if event.button != 1 or event.type != Gdk.EventType.BUTTON_PRESS:
             return False
         if event.state & (
@@ -524,6 +566,7 @@ class ColumnView(Gtk.Box):
             return False
 
         path = row.item.path
+        self._pressed_path = path
         if event.state & Gdk.ModifierType.SHIFT_MASK:
             if self.mark_anchor_path is None:
                 self.mark_anchor_path = self.active_item_path or path
@@ -531,11 +574,13 @@ class ColumnView(Gtk.Box):
         elif event.state & Gdk.ModifierType.CONTROL_MASK:
             self._toggle_mark(path)
         else:
-            # A directory click is navigation. It becomes an operation mark
-            # only through explicit Space/Ctrl/Shift marking.
-            self.marked_paths = set() if row.item.is_dir else {path}
-            self.mark_anchor_path = path
-            self._refresh_mark_styles()
+            if path in self.marked_paths:
+                # Keep the full marked set long enough for GTK's drag
+                # threshold to be crossed. A click without a drag collapses
+                # it normally in _on_button_release().
+                self._pending_plain_click_path = path
+            else:
+                self._apply_plain_click_marks(row.item)
 
         # SINGLE mode may natively deselect a Ctrl-clicked active row. Restore
         # that clicked row after GTK processes the event so it remains active.
@@ -544,6 +589,77 @@ class ColumnView(Gtk.Box):
                 Gdk.ModifierType.SHIFT_MASK):
             GLib.idle_add(self._ensure_mouse_active, row)
         return False
+
+    def _on_button_release(self, listbox, event):
+        """Complete a plain click only if it did not become a drag."""
+        if event.button != 1:
+            return False
+        pending_path = self._pending_plain_click_path
+        self._pending_plain_click_path = None
+        self._pressed_path = None
+        if pending_path is None:
+            return False
+        row = self._row_for_path(pending_path)
+        if row is not None:
+            self._apply_plain_click_marks(row.item)
+        return False
+
+    def _apply_plain_click_marks(self, item):
+        """Apply the existing plain-click operation-selection semantics."""
+        self.marked_paths = set() if item.is_dir else {item.path}
+        self.mark_anchor_path = item.path
+        self._refresh_mark_styles()
+
+    def _row_for_path(self, path):
+        path = Path(path)
+        for row in self.listbox.get_children():
+            if hasattr(row, 'item') and row.item.path == path:
+                return row
+        return None
+
+    def _on_drag_begin(self, listbox, context):
+        """Snapshot drag targets before mouse release can alter marks."""
+        self._drag_paths = resolve_drag_paths(
+            (item.path for item in self.get_marked_items()),
+            self._pressed_path,
+        )
+        self._pending_plain_click_path = None
+        if self._drag_paths:
+            Gtk.drag_set_icon_name(context, "text-x-generic", 0, 0)
+
+    def _on_drag_data_get(self, listbox, context, selection_data, info, time_):
+        """Publish every dragged local path using the standard URI target."""
+        if self._drag_paths:
+            selection_data.set_uris([
+                path.resolve().as_uri() for path in self._drag_paths
+            ])
+
+    def _on_drag_end(self, listbox, context):
+        drag_paths = self._drag_paths
+        action = context.get_selected_action()
+        self._pressed_path = None
+        self._pending_plain_click_path = None
+        self._drag_paths = ()
+        if drag_paths and action & Gdk.DragAction.MOVE:
+            self.on_drag_finished(drag_paths)
+
+    def _on_drag_data_received(self, listbox, context, x, y,
+                               selection_data, info, time_):
+        """Resolve the drop row and delegate filesystem semantics upward."""
+        row = self.listbox.get_row_at_y(int(y))
+        item = row.item if row is not None and hasattr(row, 'item') else None
+        destination_directory = resolve_operation_destination(
+            self.path,
+            item.path if item is not None else None,
+            item.is_dir if item is not None else False,
+        )
+        self.on_files_dropped(
+            selection_data.get_uris() or (),
+            destination_directory,
+            context.get_selected_action(),
+            context,
+            time_,
+        )
 
     def _ensure_mouse_active(self, row):
         """Keeps a modifier-clicked row active without opening it."""
@@ -1260,10 +1376,13 @@ class SearchResultsView(Gtk.Box):
 class MillerColumnsContainer(Gtk.Box):
     """Container for Miller columns with resizing support"""
 
-    def __init__(self, on_item_selected, on_item_activated):
+    def __init__(self, on_item_selected, on_item_activated,
+                 on_files_dropped, on_drag_finished):
         super().__init__(orientation=Gtk.Orientation.HORIZONTAL)
         self.on_item_selected_callback = on_item_selected
         self.on_item_activated_callback = on_item_activated
+        self.on_files_dropped_callback = on_files_dropped
+        self.on_drag_finished_callback = on_drag_finished
 
         self.columns = []  # List of ColumnView
         self.handles = []  # List of ResizeHandle
@@ -1279,7 +1398,13 @@ class MillerColumnsContainer(Gtk.Box):
     def add_column(self, path):
         """Adds a new column"""
         self.clear_file_preview()
-        column = ColumnView(path, self._on_item_selected, self.on_item_activated_callback)
+        column = ColumnView(
+            path,
+            self._on_item_selected,
+            self.on_item_activated_callback,
+            self.on_files_dropped_callback,
+            self.on_drag_finished_callback,
+        )
 
         # If there are existing columns, add a resize handle
         if self.columns:
@@ -1532,7 +1657,9 @@ class MillerColumnsWindow(Gtk.ApplicationWindow):
         # Columns container
         self.columns_container = MillerColumnsContainer(
             self._on_item_selected,
-            self._on_item_activated
+            self._on_item_activated,
+            self._on_files_dropped,
+            self._on_drag_finished,
         )
         columns_frame = Gtk.Frame()
         columns_frame.add(self.columns_container)
@@ -1731,12 +1858,16 @@ class MillerColumnsWindow(Gtk.ApplicationWindow):
 
     def _navigate_to(self, path):
         """Navigates to a specific path"""
-        path = Path(path).resolve()
+        try:
+            path = Path(path).resolve()
+        except (OSError, RuntimeError):
+            return False
 
-        if not path.exists():
-            return
+        if not path.is_dir():
+            return False
 
         self.columns_container.clear()
+        self.preview_panel.clear()
 
         parts = path.parts
         current = Path(parts[0])
@@ -1747,7 +1878,12 @@ class MillerColumnsWindow(Gtk.ApplicationWindow):
             next_path = current / part
             if next_path.is_dir():
                 if self.columns_container.columns:
-                    self.columns_container.columns[-1].select_path(next_path)
+                    # This selection only renders the ancestry cursor. Its
+                    # normal callback would add the child here, and the next
+                    # line would then add the same semantic column again.
+                    self.columns_container.columns[-1].select_path(
+                        next_path, notify_navigation=False
+                    )
                 self.columns_container.add_column(next_path)
                 current = next_path
 
@@ -1758,6 +1894,7 @@ class MillerColumnsWindow(Gtk.ApplicationWindow):
 
         self.current_path = path
         self._update_path_bar()
+        return True
 
     def _on_item_selected(self, column, item):
         """Handles item selection"""
@@ -2165,9 +2302,11 @@ class MillerColumnsWindow(Gtk.ApplicationWindow):
             return
         self._execute_paste(mode, paths, destination_directory)
 
-    def _execute_paste(self, mode, clipboard_paths, destination_directory):
+    def _execute_paste(self, mode, clipboard_paths, destination_directory,
+                       update_cut_clipboard=True, failure_title="Paste failed"):
         """Copy or move parsed clipboard paths into a resolved destination."""
         clipboard_paths = tuple(Path(path) for path in clipboard_paths)
+        destination_directory = Path(destination_directory)
         failures = []
         succeeded = []
         affected_directories = {destination_directory}
@@ -2187,7 +2326,7 @@ class MillerColumnsWindow(Gtk.ApplicationWindow):
         # operation may have created a partial destination before reporting it.
         self._refresh_after_mutation(affected_directories)
 
-        if mode == CLIPBOARD_CUT:
+        if mode == CLIPBOARD_CUT and update_cut_clipboard:
             failed_paths = {path for path, _message in failures}
             remaining_paths = tuple(
                 path for path in clipboard_paths if path in failed_paths
@@ -2203,7 +2342,40 @@ class MillerColumnsWindow(Gtk.ApplicationWindow):
                     Gdk.CURRENT_TIME,
                 )
 
-        self._show_operation_failures("Paste failed", failures)
+        self._show_operation_failures(failure_title, failures)
+        return tuple(succeeded), tuple(failures)
+
+    def _on_files_dropped(self, uris, destination_directory, action,
+                          drag_context, time_):
+        """Execute one external/internal URI drop through safe file ops."""
+        try:
+            paths = parse_file_uri_list("\n".join(uris))
+            if not paths:
+                raise FileOperationError("Dropped file list is empty")
+        except (FileOperationError, UnicodeError) as error:
+            Gtk.drag_finish(drag_context, False, False, time_)
+            self._show_error("Drop failed", str(error))
+            return
+
+        mode = (
+            CLIPBOARD_CUT
+            if action & Gdk.DragAction.MOVE
+            else CLIPBOARD_COPY
+        )
+        succeeded, _failures = self._execute_paste(
+            mode,
+            paths,
+            destination_directory,
+            update_cut_clipboard=False,
+            failure_title="Drop failed",
+        )
+        # The receiver has already performed MOVE itself, so the source must
+        # never delete files in response to drag completion.
+        Gtk.drag_finish(drag_context, bool(succeeded), False, time_)
+
+    def _on_drag_finished(self, paths):
+        """Refresh sources after another application accepted a MOVE drag."""
+        self._refresh_after_mutation({Path(path).parent for path in paths})
 
     def _rename_operation_target(self, column):
         """Prompt for and rename exactly one focused-column target."""
@@ -2491,6 +2663,11 @@ class MillerColumnsApp(Gtk.Application):
             if path.startswith('file://'):
                 path = urllib.parse.unquote(path[7:])
             self.start_path = path
+        else:
+            # Every launcher invocation without a path starts in the user's
+            # home directory, rather than reusing an earlier invocation's
+            # command-line path from this long-lived Gtk.Application.
+            self.start_path = None
 
         self.activate()
         return 0

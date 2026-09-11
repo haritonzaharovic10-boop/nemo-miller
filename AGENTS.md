@@ -85,3 +85,15 @@ Never:
 - rewrite accepted history;
 - commit directly to `main`;
 - merge into `dev` without review.
+
+## Explicit user-level default-manager installation
+
+When explicitly requested by the user, Codex may:
+
+- install or update ~/.local/share/applications/miller-columns.desktop;
+- register it for inode/directory;
+- change the user-level default handler for inode/directory;
+- modify only the corresponding user-level MIME association entries.
+
+It must still never modify /usr, remove stock Nemo, restart Nemo,
+or change stock Nemo settings.
