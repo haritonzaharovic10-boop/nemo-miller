@@ -68,6 +68,32 @@ def resolve_drag_paths(ordered_marked_paths, pressed_path):
     return (pressed_path,)
 
 
+def resolve_refreshed_active_path(previous_paths, refreshed_paths,
+                                  previous_active_path,
+                                  preferred_active_path=None):
+    """Preserve ACTIVE or choose its next/previous neighbor after refresh."""
+    previous_paths = tuple(Path(path) for path in previous_paths)
+    refreshed_paths = tuple(Path(path) for path in refreshed_paths)
+    previous_active_path = (
+        Path(previous_active_path)
+        if previous_active_path is not None else None
+    )
+    preferred_active_path = (
+        Path(preferred_active_path)
+        if preferred_active_path is not None else previous_active_path
+    )
+
+    if preferred_active_path in refreshed_paths:
+        return preferred_active_path
+    if previous_active_path is None or not refreshed_paths:
+        return None
+    try:
+        previous_index = previous_paths.index(previous_active_path)
+    except ValueError:
+        return None
+    return refreshed_paths[min(previous_index, len(refreshed_paths) - 1)]
+
+
 def serialize_gnome_file_clipboard(mode, paths):
     """Serialize paths using the GNOME/Nemo copied-files convention."""
     if mode not in (CLIPBOARD_COPY, CLIPBOARD_CUT):
@@ -269,6 +295,75 @@ class FilePreviewData:
     text: str = ""
     truncated: bool = False
     message: str = ""
+
+
+@dataclass(frozen=True)
+class DirectorySizeData:
+    """Result of one cancellable recursive directory scan."""
+
+    size: int
+    file_count: int
+    directory_count: int
+    error_count: int
+    cancelled: bool = False
+
+
+def calculate_directory_size(path, cancel_event=None):
+    """Calculate apparent content size without following directory symlinks."""
+    path = Path(path)
+    size = 0
+    file_count = 0
+    directory_count = 0
+    error_count = 0
+
+    if cancel_event is not None and cancel_event.is_set():
+        return DirectorySizeData(0, 0, 0, 0, cancelled=True)
+
+    if path.is_symlink():
+        try:
+            size = path.lstat().st_size
+        except OSError:
+            error_count = 1
+        return DirectorySizeData(size, 1, 0, error_count)
+
+    pending_directories = [path]
+    while pending_directories:
+        if cancel_event is not None and cancel_event.is_set():
+            return DirectorySizeData(
+                size, file_count, directory_count, error_count,
+                cancelled=True,
+            )
+
+        directory = pending_directories.pop()
+        try:
+            entries = os.scandir(directory)
+        except OSError:
+            error_count += 1
+            continue
+
+        with entries:
+            for entry in entries:
+                if cancel_event is not None and cancel_event.is_set():
+                    return DirectorySizeData(
+                        size, file_count, directory_count, error_count,
+                        cancelled=True,
+                    )
+                try:
+                    if entry.is_symlink():
+                        size += entry.stat(follow_symlinks=False).st_size
+                        file_count += 1
+                    elif entry.is_dir(follow_symlinks=False):
+                        directory_count += 1
+                        pending_directories.append(Path(entry.path))
+                    else:
+                        size += entry.stat(follow_symlinks=False).st_size
+                        file_count += 1
+                except OSError:
+                    error_count += 1
+
+    return DirectorySizeData(
+        size, file_count, directory_count, error_count
+    )
 
 
 def load_file_preview(path):
@@ -754,6 +849,8 @@ class ColumnView(Gtk.Box):
 
     def refresh(self, replacements=None):
         """Repopulate while preserving surviving active/marked paths."""
+        previous_paths = self._ordered_item_paths()
+        previous_active_path = self.active_item_path
         replacements = {
             Path(source): Path(destination)
             for source, destination in (replacements or {}).items()
@@ -772,20 +869,28 @@ class ColumnView(Gtk.Box):
         self._suppress_navigation_callback = True
         try:
             self.populate()
-            visible_paths = set(self._ordered_item_paths())
+            refreshed_paths = self._ordered_item_paths()
+            visible_paths = set(refreshed_paths)
+            selected_active_path = resolve_refreshed_active_path(
+                previous_paths,
+                refreshed_paths,
+                previous_active_path,
+                active_path,
+            )
             self.marked_paths = marked_paths & visible_paths
             self.mark_anchor_path = (
                 anchor_path if anchor_path in visible_paths else None
             )
             self.active_item_path = None
-            if active_path in visible_paths:
-                self.select_path(active_path)
+            if selected_active_path is not None:
+                self.select_path(selected_active_path)
             else:
                 self.listbox.unselect_all()
         finally:
             self._suppress_navigation_callback = False
 
         self._refresh_mark_styles()
+        return selected_active_path != previous_active_path
 
     def contains_focus(self, focused_widget):
         """Returns whether GTK focus is within this column's listbox."""
@@ -1015,6 +1120,10 @@ class PreviewPanel(Gtk.Box):
         self.set_size_request(280, -1)
 
         self.icon_theme = Gtk.IconTheme.get_default()
+        self._directory_size_request_id = 0
+        self._directory_size_cancel_event = None
+        self._current_item_path = None
+        self.connect("destroy", self._on_destroy)
 
         # Large icon
         self.icon_image = Gtk.Image()
@@ -1042,9 +1151,11 @@ class PreviewPanel(Gtk.Box):
 
     def update(self, item):
         """Updates the preview with item information"""
+        request_id = self._cancel_directory_size_request()
         if item is None:
-            self.clear()
+            self._clear_widgets()
             return
+        self._current_item_path = item.path
 
         icon = item.get_icon(self.icon_theme, 64)
         if icon:
@@ -1067,18 +1178,22 @@ class PreviewPanel(Gtk.Box):
         self._add_info_row("Type:", file_type, row)
         row += 1
 
-        # Size
-        try:
-            if item.is_dir:
-                count = sum(1 for _ in item.path.iterdir())
-                size_str = f"{count} items"
-            else:
-                size = item.path.stat().st_size
-                size_str = self._format_size(size)
-            self._add_info_row("Size:", size_str, row)
+        size_value = None
+        contents_value = None
+        if item.is_dir:
+            size_value = self._add_info_row("Size:", "Calculating…", row)
             row += 1
-        except (PermissionError, OSError):
-            pass
+            contents_value = self._add_info_row(
+                "Contents:", "Calculating…", row
+            )
+            row += 1
+        else:
+            try:
+                size = item.path.stat().st_size
+                self._add_info_row("Size:", self._format_size(size), row)
+                row += 1
+            except (PermissionError, OSError):
+                pass
 
         # Modified date
         try:
@@ -1094,6 +1209,13 @@ class PreviewPanel(Gtk.Box):
         self._add_info_row("Path:", str(item.path.parent), row)
 
         self.info_grid.show_all()
+        if item.is_dir:
+            self._start_directory_size_request(
+                request_id,
+                item.path,
+                size_value,
+                contents_value,
+            )
 
     def _add_info_row(self, label_text, value_text, row):
         """Adds an information row"""
@@ -1109,6 +1231,54 @@ class PreviewPanel(Gtk.Box):
         value.set_max_width_chars(20)
         value.set_selectable(True)
         self.info_grid.attach(value, 1, row, 1, 1)
+        return value
+
+    def _cancel_directory_size_request(self):
+        """Cancel an obsolete scan and return a fresh request identity."""
+        if self._directory_size_cancel_event is not None:
+            self._directory_size_cancel_event.set()
+        self._directory_size_cancel_event = None
+        self._directory_size_request_id += 1
+        return self._directory_size_request_id
+
+    def _start_directory_size_request(self, request_id, path,
+                                      size_value, contents_value):
+        cancel_event = threading.Event()
+        self._directory_size_cancel_event = cancel_event
+
+        def calculate():
+            result = calculate_directory_size(path, cancel_event)
+            GLib.idle_add(
+                self._apply_directory_size,
+                request_id,
+                Path(path),
+                size_value,
+                contents_value,
+                result,
+            )
+
+        threading.Thread(target=calculate, daemon=True).start()
+
+    def _apply_directory_size(self, request_id, path, size_value,
+                              contents_value, result):
+        """Apply a scan result only while its directory remains active."""
+        if (result.cancelled or
+                request_id != self._directory_size_request_id or
+                path != self._current_item_path):
+            return False
+
+        size_text = self._format_size(result.size)
+        if result.error_count:
+            size_text += " (partial)"
+        size_value.set_text(size_text)
+
+        item_count = result.file_count + result.directory_count
+        contents_text = "Empty" if item_count == 0 else f"{item_count} items"
+        if result.error_count:
+            contents_text += f" · {result.error_count} unreadable"
+        contents_value.set_text(contents_text)
+        self._directory_size_cancel_event = None
+        return False
 
     def _format_size(self, size):
         """Formats size in human-readable format"""
@@ -1120,10 +1290,18 @@ class PreviewPanel(Gtk.Box):
 
     def clear(self):
         """Clears the metadata inspector."""
+        self._cancel_directory_size_request()
+        self._clear_widgets()
+
+    def _clear_widgets(self):
+        self._current_item_path = None
         self.icon_image.clear()
         self.name_label.set_text("")
         for child in self.info_grid.get_children():
             self.info_grid.remove(child)
+
+    def _on_destroy(self, widget):
+        self._cancel_directory_size_request()
 
 
 @dataclass
@@ -2509,6 +2687,7 @@ class MillerColumnsWindow(Gtk.ApplicationWindow):
         directory_paths = {Path(path) for path in directory_paths}
         replacements = replacements or {}
         focused_column = self._get_focused_column()
+        focused_active_changed = False
 
         index = 0
         while index < len(self.columns_container.columns):
@@ -2520,8 +2699,18 @@ class MillerColumnsWindow(Gtk.ApplicationWindow):
                     )
                 break
             if column.path in directory_paths:
-                column.refresh(replacements)
+                active_changed = column.refresh(replacements)
+                if column is focused_column:
+                    focused_active_changed = active_changed
             index += 1
+
+        if (focused_active_changed and
+                focused_column in self.columns_container.columns):
+            active_item = focused_column.get_active_item()
+            self.columns_container.remove_columns_after(focused_column)
+            self.columns_container.reserve_child_slot(focused_column)
+            if active_item is not None and active_item.is_dir:
+                self.columns_container.add_column(active_item.path)
 
         if self.columns_container.columns:
             self.current_path = self.columns_container.columns[-1].path

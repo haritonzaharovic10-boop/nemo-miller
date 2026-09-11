@@ -20,7 +20,8 @@ Il progetto nasce come fork di
 - Clipboard file compatibile con GNOME/Nemo.
 - Drag and drop multiplo in entrata e in uscita.
 - Anteprime di testo e immagini con limiti di lettura.
-- Pannello metadati, ricerca ricorsiva, breadcrumb e azioni terminale/Nemo.
+- Pannello metadati con calcolo annullabile della dimensione delle cartelle.
+- Ricerca ricorsiva, breadcrumb e azioni terminale/Nemo.
 - Nessuna eliminazione permanente e nessuna sovrascrittura silenziosa.
 
 ## Requisiti

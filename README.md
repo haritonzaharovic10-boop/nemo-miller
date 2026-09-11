@@ -19,7 +19,8 @@ This project began as a fork of
 - GNOME/Nemo file clipboard interoperability.
 - Multi-file drag and drop both into and out of the application.
 - Text and image previews in the next column, with bounded file reads.
-- Metadata inspector, recursive search, breadcrumbs and terminal/Nemo actions.
+- Metadata inspector with cancellable background folder-size calculation.
+- Recursive search, breadcrumbs and terminal/Nemo actions.
 - No permanent-delete command and no silent destination overwrite.
 
 ## Requirements

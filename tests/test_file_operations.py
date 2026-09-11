@@ -1,4 +1,5 @@
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -6,6 +7,7 @@ from nemo_miller_columns import (
     FileOperationError,
     MAX_PREVIEW_BYTES,
     calculate_auto_column_width,
+    calculate_directory_size,
     calculate_width_slot_count,
     copy_path,
     create_folder,
@@ -17,6 +19,7 @@ from nemo_miller_columns import (
     resolve_drag_paths,
     resolve_operation_destination,
     resolve_operation_paths,
+    resolve_refreshed_active_path,
     serialize_gnome_file_clipboard,
     trash_path,
 )
@@ -110,6 +113,64 @@ class ColumnWidthTests(unittest.TestCase):
         self.assertEqual(slots, 6)
 
 
+class RefreshActivePathTests(unittest.TestCase):
+    def setUp(self):
+        self.paths = tuple(
+            Path("/tmp") / name
+            for name in ("alpha", "bravo", "charlie")
+        )
+
+    def test_surviving_active_path_is_preserved(self):
+        selected = resolve_refreshed_active_path(
+            self.paths, self.paths, self.paths[1]
+        )
+
+        self.assertEqual(selected, self.paths[1])
+
+    def test_removed_middle_path_selects_next_at_same_index(self):
+        selected = resolve_refreshed_active_path(
+            self.paths,
+            (self.paths[0], self.paths[2]),
+            self.paths[1],
+        )
+
+        self.assertEqual(selected, self.paths[2])
+
+    def test_removed_last_path_selects_previous(self):
+        selected = resolve_refreshed_active_path(
+            self.paths,
+            self.paths[:2],
+            self.paths[2],
+        )
+
+        self.assertEqual(selected, self.paths[1])
+
+    def test_empty_refreshed_column_has_no_active_path(self):
+        selected = resolve_refreshed_active_path(
+            self.paths, (), self.paths[1]
+        )
+
+        self.assertIsNone(selected)
+
+    def test_absent_previous_active_does_not_select_first_item(self):
+        selected = resolve_refreshed_active_path(
+            self.paths, self.paths, None
+        )
+
+        self.assertIsNone(selected)
+
+    def test_renamed_active_path_uses_preferred_replacement(self):
+        renamed = Path("/tmp/renamed")
+        selected = resolve_refreshed_active_path(
+            self.paths,
+            (self.paths[0], renamed, self.paths[2]),
+            self.paths[1],
+            renamed,
+        )
+
+        self.assertEqual(selected, renamed)
+
+
 class FilePreviewTests(unittest.TestCase):
     def setUp(self):
         self.lab = tempfile.TemporaryDirectory(
@@ -170,6 +231,65 @@ class FilePreviewTests(unittest.TestCase):
         preview = load_file_preview(asset)
 
         self.assertEqual(preview.kind, "image")
+
+
+class DirectorySizeTests(unittest.TestCase):
+    def setUp(self):
+        self.lab = tempfile.TemporaryDirectory(
+            prefix="nemo-miller-directory-size-", dir="/tmp"
+        )
+        self.root = Path(self.lab.name)
+
+    def tearDown(self):
+        self.lab.cleanup()
+
+    def test_recursive_size_and_item_counts(self):
+        (self.root / "first.txt").write_bytes(b"first")
+        nested = self.root / "nested"
+        nested.mkdir()
+        (nested / "second.txt").write_bytes(b"second!")
+
+        result = calculate_directory_size(self.root)
+
+        self.assertEqual(result.size, 12)
+        self.assertEqual(result.file_count, 2)
+        self.assertEqual(result.directory_count, 1)
+        self.assertEqual(result.error_count, 0)
+        self.assertFalse(result.cancelled)
+
+    def test_directory_symlink_is_counted_without_following_target(self):
+        scanned = self.root / "scanned"
+        scanned.mkdir()
+        outside = self.root / "outside"
+        outside.mkdir()
+        (outside / "large.bin").write_bytes(b"x" * 4096)
+        link = scanned / "outside-link"
+        link.symlink_to(outside, target_is_directory=True)
+
+        result = calculate_directory_size(scanned)
+
+        self.assertEqual(result.size, link.lstat().st_size)
+        self.assertEqual(result.file_count, 1)
+        self.assertEqual(result.directory_count, 0)
+        self.assertEqual(result.error_count, 0)
+
+    def test_pre_cancelled_scan_stops_without_work(self):
+        cancel_event = threading.Event()
+        cancel_event.set()
+
+        result = calculate_directory_size(self.root, cancel_event)
+
+        self.assertTrue(result.cancelled)
+        self.assertEqual(result.size, 0)
+        self.assertEqual(result.file_count, 0)
+        self.assertEqual(result.directory_count, 0)
+
+    def test_missing_directory_is_reported_as_partial(self):
+        result = calculate_directory_size(self.root / "missing")
+
+        self.assertEqual(result.size, 0)
+        self.assertEqual(result.error_count, 1)
+        self.assertFalse(result.cancelled)
 
 
 class FileOperationLabTests(unittest.TestCase):
