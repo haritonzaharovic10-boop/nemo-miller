@@ -1,3 +1,4 @@
+import os
 import tempfile
 import threading
 import unittest
@@ -20,8 +21,14 @@ from nemo_miller_columns import (
     resolve_operation_destination,
     resolve_operation_paths,
     resolve_refreshed_active_path,
+    resolve_startup_target,
     serialize_gnome_file_clipboard,
+    sort_file_items,
     trash_path,
+    FileItem,
+    SORT_MODIFIED_NEWEST,
+    SORT_NAME,
+    next_sort_mode,
 )
 
 
@@ -169,6 +176,107 @@ class RefreshActivePathTests(unittest.TestCase):
         )
 
         self.assertEqual(selected, renamed)
+
+
+class StartupTargetTests(unittest.TestCase):
+    def setUp(self):
+        self.lab = tempfile.TemporaryDirectory(
+            prefix="nemo-miller-startup-target-", dir="/tmp"
+        )
+        self.root = Path(self.lab.name).resolve()
+
+    def tearDown(self):
+        self.lab.cleanup()
+
+    def test_directory_argument_starts_in_directory(self):
+        directory = self.root / "directory"
+        directory.mkdir()
+
+        location, selected = resolve_startup_target(directory, self.root)
+
+        self.assertEqual(location, directory)
+        self.assertIsNone(selected)
+
+    def test_file_argument_starts_in_parent_and_selects_file(self):
+        directory = self.root / "directory"
+        directory.mkdir()
+        path = directory / "document.txt"
+        path.write_text("document", encoding="utf-8")
+
+        location, selected = resolve_startup_target(path, self.root)
+
+        self.assertEqual(location, directory)
+        self.assertEqual(selected, path)
+
+    def test_file_uri_is_decoded(self):
+        directory = self.root / "folder with spaces"
+        directory.mkdir()
+        path = directory / "file name.txt"
+        path.write_text("document", encoding="utf-8")
+
+        location, selected = resolve_startup_target(path.as_uri(), self.root)
+
+        self.assertEqual(location, directory)
+        self.assertEqual(selected, path)
+
+    def test_invalid_argument_falls_back_to_home(self):
+        home = self.root / "home"
+        home.mkdir()
+
+        location, selected = resolve_startup_target(
+            self.root / "missing", home
+        )
+
+        self.assertEqual(location, home)
+        self.assertIsNone(selected)
+
+
+class SortingTests(unittest.TestCase):
+    def setUp(self):
+        self.lab = tempfile.TemporaryDirectory(
+            prefix="nemo-miller-sort-", dir="/tmp"
+        )
+        self.root = Path(self.lab.name)
+        self.old = self.root / "a-old.txt"
+        self.new = self.root / "z-new.txt"
+        self.old.write_text("old", encoding="utf-8")
+        self.new.write_text("new", encoding="utf-8")
+        os.utime(self.old, (1000, 1000))
+        os.utime(self.new, (2000, 2000))
+
+    def tearDown(self):
+        self.lab.cleanup()
+
+    def test_alphabetical_mode_sorts_names(self):
+        items = [FileItem(self.old), FileItem(self.new)]
+
+        ordered = sort_file_items(items, SORT_NAME)
+
+        self.assertEqual([item.name for item in ordered], [
+            "a-old.txt", "z-new.txt"
+        ])
+
+    def test_recently_modified_mode_places_latest_first(self):
+        items = [FileItem(self.old), FileItem(self.new)]
+
+        ordered = sort_file_items(items, SORT_MODIFIED_NEWEST)
+
+        self.assertEqual([item.name for item in ordered], [
+            "z-new.txt", "a-old.txt"
+        ])
+
+    def test_directories_remain_grouped_before_files(self):
+        directory = self.root / "directory"
+        directory.mkdir()
+        items = [FileItem(self.old), FileItem(directory)]
+
+        ordered = sort_file_items(items, SORT_MODIFIED_NEWEST)
+
+        self.assertTrue(ordered[0].is_dir)
+
+    def test_tab_cycles_alphabetical_then_recently_modified(self):
+        self.assertEqual(next_sort_mode(SORT_NAME), SORT_MODIFIED_NEWEST)
+        self.assertEqual(next_sort_mode(SORT_MODIFIED_NEWEST), SORT_NAME)
 
 
 class FilePreviewTests(unittest.TestCase):

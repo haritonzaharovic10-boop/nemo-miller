@@ -12,6 +12,7 @@ Il progetto nasce come fork di
 ## Funzionalità
 
 - Colonne Miller stabili e ridimensionabili con anteprima della cartella figlia.
+- Tab alterna l'ordinamento alfabetico e quello per modifica più recente.
 - Navigazione nativa Up/Down e navigazione esplicita tra colonne con Left/Right.
 - Elemento attivo separato dagli elementi marcati per operazioni multiple.
 - Space modifica un marcatore, Shift estende un intervallo e Ctrl+A marca tutta
@@ -85,6 +86,7 @@ Nemo di sistema non viene mai rimosso o modificato.
 | `Up` / `Down` | Sposta l'elemento attivo nella colonna corrente |
 | `Left` | Passa alla colonna Miller precedente |
 | `Right` / `Enter` | Entra nella cartella attiva o apre il file attivo |
+| `Tab` | Alterna ordine alfabetico e modifiche più recenti |
 | `Backspace` | Va alla cartella padre nel filesystem |
 | `Space` | Aggiunge/rimuove il marcatore dell'elemento attivo |
 | `Shift+Up/Down` | Estende l'intervallo marcato |

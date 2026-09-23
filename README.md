@@ -13,6 +13,7 @@ This project began as a fork of
 
 - Stable, resizable Miller columns with directory look-ahead.
 - Native Up/Down navigation and explicit Left/Right column navigation.
+- Tab switches between alphabetical and newest-modified-first sorting.
 - Separate active item and marked-item states for multi-file operations.
 - Space toggles marks; Shift extends a range; Ctrl+A marks a whole column.
 - Copy, cut, paste, rename, new-folder and Trash operations.
@@ -84,6 +85,7 @@ it. Stock Nemo is never removed or modified.
 | `Up` / `Down` | Move the active item within the focused column |
 | `Left` | Move to the previous Miller column |
 | `Right` / `Enter` | Enter an active directory, or open an active file |
+| `Tab` | Toggle alphabetical / newest modified first sorting |
 | `Backspace` | Navigate to the filesystem parent |
 | `Space` | Toggle the active item's marked state |
 | `Shift+Up/Down` | Extend marked range |

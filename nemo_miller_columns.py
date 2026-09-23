@@ -36,6 +36,9 @@ GNOME_COPIED_FILES_NAME = "x-special/gnome-copied-files"
 URI_LIST_NAME = "text/uri-list"
 GNOME_COPIED_FILES_INFO = 1
 URI_LIST_INFO = 2
+SORT_NAME = "name"
+SORT_MODIFIED_NEWEST = "modified-newest"
+SORT_MODES = (SORT_NAME, SORT_MODIFIED_NEWEST)
 
 
 class FileOperationError(Exception):
@@ -66,6 +69,65 @@ def resolve_drag_paths(ordered_marked_paths, pressed_path):
     if pressed_path in marked:
         return marked
     return (pressed_path,)
+
+
+def decode_local_path(value):
+    """Decode a local file URI or ordinary path argument."""
+    value = str(value)
+    parsed = urllib.parse.urlsplit(value)
+    if parsed.scheme == "file":
+        if parsed.netloc not in ("", "localhost"):
+            raise ValueError(f"Unsupported file URI host: {parsed.netloc}")
+        return Path(urllib.parse.unquote(parsed.path))
+    return Path(value)
+
+
+def resolve_startup_target(value, home=None):
+    """Return an existing start directory and optional file to select."""
+    fallback = Path(home or Path.home()).expanduser()
+    try:
+        fallback = fallback.resolve(strict=True)
+    except (OSError, RuntimeError):
+        fallback = Path.home()
+
+    if value is None:
+        return fallback, None
+    try:
+        target = decode_local_path(value).expanduser().resolve(strict=True)
+    except (OSError, RuntimeError, ValueError):
+        return fallback, None
+    if target.is_dir():
+        return target, None
+    if target.is_file():
+        return target.parent, target
+    return fallback, None
+
+
+def sort_file_items(items, sort_mode=SORT_NAME):
+    """Sort FileItems with folders grouped first and a stable name tie-break."""
+    if sort_mode not in SORT_MODES:
+        sort_mode = SORT_NAME
+
+    def key(item):
+        name_key = item.name.casefold()
+        if sort_mode == SORT_NAME:
+            return (not item.is_dir, name_key)
+        try:
+            modified = item.path.stat().st_mtime
+        except OSError:
+            modified = float("-inf")
+        return (not item.is_dir, -modified, name_key)
+
+    return sorted(items, key=key)
+
+
+def next_sort_mode(sort_mode):
+    """Return the next mode in the two-mode Tab cycle."""
+    try:
+        index = SORT_MODES.index(sort_mode)
+    except ValueError:
+        index = 0
+    return SORT_MODES[(index + 1) % len(SORT_MODES)]
 
 
 def resolve_refreshed_active_path(previous_paths, refreshed_paths,
@@ -457,13 +519,15 @@ class ColumnView(Gtk.Box):
     MIN_WIDTH = 100
 
     def __init__(self, path, on_item_selected, on_item_activated,
-                 on_files_dropped, on_drag_finished):
+                 on_files_dropped, on_drag_finished,
+                 sort_mode=SORT_NAME):
         super().__init__(orientation=Gtk.Orientation.VERTICAL)
         self.path = Path(path)
         self.on_item_selected = on_item_selected
         self.on_item_activated = on_item_activated
         self.on_files_dropped = on_files_dropped
         self.on_drag_finished = on_drag_finished
+        self.sort_mode = sort_mode
         self.icon_theme = Gtk.IconTheme.get_default()
         self.active_item_path = None
         self.marked_paths = set()
@@ -531,8 +595,7 @@ class ColumnView(Gtk.Box):
                 except PermissionError:
                     continue
 
-            # Sort: directories first, then files, alphabetically
-            items.sort(key=lambda x: (not x.is_dir, x.name.lower()))
+            items = sort_file_items(items, self.sort_mode)
 
             for item in items:
                 row = self._create_row(item)
@@ -635,6 +698,22 @@ class ColumnView(Gtk.Box):
             row.grab_focus()
         else:
             self.listbox.grab_focus()
+
+    def select_boundary_item(self, first):
+        """Establish ACTIVE when a focused column does not have one yet."""
+        if first:
+            row = self.listbox.get_row_at_index(0)
+        else:
+            rows = [
+                child for child in self.listbox.get_children()
+                if isinstance(child, Gtk.ListBoxRow) and hasattr(child, 'item')
+            ]
+            row = rows[-1] if rows else None
+        if row is None or not hasattr(row, 'item'):
+            return False
+        self.listbox.select_row(row)
+        row.grab_focus()
+        return True
 
     def get_operation_destination(self):
         """Resolve paste/new-folder destination from this column's ACTIVE."""
@@ -891,6 +970,12 @@ class ColumnView(Gtk.Box):
 
         self._refresh_mark_styles()
         return selected_active_path != previous_active_path
+
+    def set_sort_mode(self, sort_mode):
+        if self.sort_mode == sort_mode:
+            return
+        self.sort_mode = sort_mode
+        self.refresh()
 
     def contains_focus(self, focused_widget):
         """Returns whether GTK focus is within this column's listbox."""
@@ -1556,12 +1641,19 @@ class MillerColumnsContainer(Gtk.Box):
     """Container for Miller columns with resizing support"""
 
     def __init__(self, on_item_selected, on_item_activated,
-                 on_files_dropped, on_drag_finished):
+                 on_files_dropped, on_drag_finished,
+                 sort_mode=SORT_NAME):
         super().__init__(orientation=Gtk.Orientation.HORIZONTAL)
+        self.set_hexpand(True)
+        self.set_halign(Gtk.Align.FILL)
+        self.set_size_request(1, -1)
         self.on_item_selected_callback = on_item_selected
         self.on_item_activated_callback = on_item_activated
         self.on_files_dropped_callback = on_files_dropped
         self.on_drag_finished_callback = on_drag_finished
+        self.sort_mode = sort_mode
+        self.connect("size-allocate", self._on_size_allocate)
+        self._width_distribution_source_id = None
 
         self.columns = []  # List of ColumnView
         self.handles = []  # List of ResizeHandle
@@ -1583,7 +1675,11 @@ class MillerColumnsContainer(Gtk.Box):
             self.on_item_activated_callback,
             self.on_files_dropped_callback,
             self.on_drag_finished_callback,
+            self.sort_mode,
         )
+        # Do not let a newly-created column raise the window's natural
+        # width before the container has had a chance to distribute space.
+        column.set_size_request(1, -1)
 
         # If there are existing columns, add a resize handle
         if self.columns:
@@ -1596,13 +1692,17 @@ class MillerColumnsContainer(Gtk.Box):
         self.columns.append(column)
         self.column_widths.append(-1)  # -1 means "auto"
 
+        allocation_width = self.get_allocation().width
+        if allocation_width > 1:
+            self._apply_widths(allocation_width)
+
         # Width distribution reserves an empty child slot. Do not let GtkBox
         # expand real columns into that reserved space.
         self.pack_start(column, False, True, 0)
         column.show_all()
 
         # Recalculate widths
-        GLib.idle_add(self._distribute_widths)
+        self._schedule_width_distribution()
 
         return column
 
@@ -1628,7 +1728,7 @@ class MillerColumnsContainer(Gtk.Box):
                 handle.destroy()
 
         # Recalculate widths
-        GLib.idle_add(self._distribute_widths)
+        self._schedule_width_distribution()
 
     def clear(self):
         """Removes all columns"""
@@ -1663,7 +1763,7 @@ class MillerColumnsContainer(Gtk.Box):
         self.pack_start(preview, False, True, 0)
         separator.show_all()
         preview.show_all()
-        GLib.idle_add(self._distribute_widths)
+        self._schedule_width_distribution()
 
     def clear_file_preview(self):
         """Remove the transient preview slot without changing directories."""
@@ -1681,7 +1781,7 @@ class MillerColumnsContainer(Gtk.Box):
         """Handles selection and recalculates widths"""
         self.reserve_child_slot(column)
         self.on_item_selected_callback(column, item)
-        GLib.idle_add(self._distribute_widths)
+        self._schedule_width_distribution()
 
     def reserve_child_slot(self, column):
         """Reserve stable width for one potential child of ``column``."""
@@ -1691,10 +1791,30 @@ class MillerColumnsContainer(Gtk.Box):
         self.width_slot_count = calculate_width_slot_count(
             len(self.columns), self.reserved_child_column_index
         )
-        GLib.idle_add(self._distribute_widths)
+        self._schedule_width_distribution()
+
+    def set_sort_mode(self, sort_mode):
+        if sort_mode not in SORT_MODES:
+            return
+        self.sort_mode = sort_mode
+        for column in self.columns:
+            column.set_sort_mode(sort_mode)
+
+    def _on_size_allocate(self, widget, allocation):
+        # GTK emits this while allocations are still being committed. Apply
+        # widths in one idle callback using the final container allocation.
+        self._schedule_width_distribution()
+
+    def _schedule_width_distribution(self):
+        if self._width_distribution_source_id is None:
+            self._width_distribution_source_id = GLib.idle_add(
+                self._distribute_widths,
+                priority=GLib.PRIORITY_HIGH_IDLE,
+            )
 
     def _distribute_widths(self):
         """Distributes widths equally among columns"""
+        self._width_distribution_source_id = None
         if not self.columns:
             return False
 
@@ -1703,6 +1823,12 @@ class MillerColumnsContainer(Gtk.Box):
 
         if total_width <= 1:
             return False
+
+        self._apply_widths(total_width)
+        return False
+
+    def _apply_widths(self, total_width):
+        """Apply one coherent width calculation to every visible column."""
 
         self.width_slot_count = calculate_width_slot_count(
             len(self.columns), self.reserved_child_column_index
@@ -1722,8 +1848,6 @@ class MillerColumnsContainer(Gtk.Box):
 
         if self.file_preview is not None:
             self.file_preview.set_size_request(auto_width, -1)
-
-        return False
 
     def _on_handle_drag(self, handle, delta):
         """Handles dragging of a resize handle"""
@@ -1770,7 +1894,10 @@ class MillerColumnsWindow(Gtk.ApplicationWindow):
         super().__init__(application=app, title="Nemo Miller Columns")
 
         self.set_default_size(1200, 700)
-        self.current_path = Path(start_path or Path.home())
+        self.current_path, self.startup_selection_path = resolve_startup_target(
+            start_path
+        )
+        self.sort_mode = SORT_NAME
 
         # Search state
         self.search_mode = False
@@ -1813,6 +1940,7 @@ class MillerColumnsWindow(Gtk.ApplicationWindow):
         self.pending_focus_keyval = None
         self.pending_focus_source_id = None
         self.pending_focus_select_first = False
+        self.path_focus_source_id = None
 
         self._setup_css()
 
@@ -1838,6 +1966,7 @@ class MillerColumnsWindow(Gtk.ApplicationWindow):
             self._on_item_activated,
             self._on_files_dropped,
             self._on_drag_finished,
+            self.sort_mode,
         )
         columns_frame = Gtk.Frame()
         columns_frame.add(self.columns_container)
@@ -1862,6 +1991,10 @@ class MillerColumnsWindow(Gtk.ApplicationWindow):
 
         # Navigate to initial path
         self._navigate_to(self.current_path)
+        if self.startup_selection_path is not None:
+            self.columns_container.columns[-1].select_path(
+                self.startup_selection_path
+            )
 
         self.connect("key-press-event", self._on_key_press)
         self.miller_key_controller = Gtk.EventControllerKey.new(self)
@@ -1999,6 +2132,14 @@ class MillerColumnsWindow(Gtk.ApplicationWindow):
         self.search_entry.connect("stop-search", self._on_search_stopped)
         toolbar_box.pack_start(self.search_entry, False, False, 0)
 
+        self.sort_combo = Gtk.ComboBoxText()
+        self.sort_combo.append(SORT_NAME, "Name: A to Z")
+        self.sort_combo.append(SORT_MODIFIED_NEWEST, "Modified: newest first")
+        self.sort_combo.set_active_id(self.sort_mode)
+        self.sort_combo.set_tooltip_text("Sort items in Miller columns")
+        self.sort_combo.connect("changed", self._on_sort_changed)
+        toolbar_box.pack_start(self.sort_combo, False, False, 0)
+
         # Open in Nemo button
         nemo_btn = Gtk.Button.new_from_icon_name("folder-open-symbolic", Gtk.IconSize.BUTTON)
         nemo_btn.set_tooltip_text("Open in Nemo")
@@ -2072,7 +2213,37 @@ class MillerColumnsWindow(Gtk.ApplicationWindow):
 
         self.current_path = path
         self._update_path_bar()
+        self._schedule_path_focus()
         return True
+
+    def _schedule_path_focus(self):
+        """Focus the deepest rebuilt column after GTK finishes layout."""
+        if self.path_focus_source_id is not None:
+            GLib.source_remove(self.path_focus_source_id)
+        self.path_focus_source_id = GLib.idle_add(
+            self._apply_path_focus,
+            priority=GLib.PRIORITY_HIGH_IDLE,
+        )
+
+    def _apply_path_focus(self):
+        self.path_focus_source_id = None
+        if (self.search_mode or
+                not self.columns_container.columns):
+            return False
+        column = self.columns_container.columns[-1]
+        column.grab_navigation_focus(select_first=False)
+        self.columns_container.reserve_child_slot(column)
+        self._synchronize_column_context(column)
+        return False
+
+    def _on_sort_changed(self, combo):
+        sort_mode = combo.get_active_id()
+        if sort_mode:
+            focused_column = self._get_focused_column()
+            self.sort_mode = sort_mode
+            self.columns_container.set_sort_mode(sort_mode)
+            if focused_column in self.columns_container.columns:
+                focused_column.grab_navigation_focus()
 
     def _on_item_selected(self, column, item):
         """Handles item selection"""
@@ -2341,6 +2512,15 @@ class MillerColumnsWindow(Gtk.ApplicationWindow):
             return True
 
         if not control and not shift:
+            if (keyval in (Gdk.KEY_Up, Gdk.KEY_KP_Up,
+                           Gdk.KEY_Down, Gdk.KEY_KP_Down) and
+                    column.get_active_item() is None):
+                return column.select_boundary_item(
+                    keyval in (Gdk.KEY_Down, Gdk.KEY_KP_Down)
+                )
+            if keyval == Gdk.KEY_Tab:
+                self.sort_combo.set_active_id(next_sort_mode(self.sort_mode))
+                return True
             if keyval == Gdk.KEY_F2:
                 self._rename_operation_target(column)
                 return True
@@ -2840,6 +3020,7 @@ class MillerColumnsApp(Gtk.Application):
     def do_activate(self):
         """Activates the application"""
         win = MillerColumnsWindow(self, self.start_path)
+        win.maximize()
         win.present()
 
     def do_command_line(self, command_line):
@@ -2847,11 +3028,7 @@ class MillerColumnsApp(Gtk.Application):
         args = command_line.get_arguments()
 
         if len(args) > 1:
-            path = args[1]
-            # Handle file:// URI
-            if path.startswith('file://'):
-                path = urllib.parse.unquote(path[7:])
-            self.start_path = path
+            self.start_path = args[1]
         else:
             # Every launcher invocation without a path starts in the user's
             # home directory, rather than reusing an earlier invocation's
@@ -2867,11 +3044,7 @@ def main():
     start_path = None
 
     if len(sys.argv) > 1:
-        path = sys.argv[1]
-        # Handle file:// URI
-        if path.startswith('file://'):
-            path = urllib.parse.unquote(path[7:])
-        start_path = path
+        start_path = sys.argv[1]
 
     app = MillerColumnsApp(start_path)
     return app.run(sys.argv)
